@@ -10,32 +10,40 @@ If you have multiple ChatGPT, Claude, Copilot, or other subscription accounts, t
 pi install git:github.com/hjanuschka/multi-pass
 ```
 
-Or with npm (once published):
+## Usage
 
-```bash
-pi install npm:pi-multi-pass
+### TUI command: `/subs`
+
+Manage subscriptions interactively -- no env vars or config files needed.
+
+```
+/subs          Open the subscription manager menu
+/subs add      Add a new subscription (pick provider, optional label)
+/subs remove   Remove a subscription and logout
+/subs login    Login to a subscription (directs to /login)
+/subs logout   Logout from a subscription
+/subs list     List all extra subscriptions with auth status
+/subs status   Show detailed status (token expiry, model count, source)
 ```
 
-## Configuration
+#### Adding a subscription
 
-Set the `MULTI_SUB` environment variable with the providers and number of extra accounts:
+1. `/subs add`
+2. Pick a provider (e.g., `openai-codex`)
+3. Optionally add a label (e.g., "work", "personal")
+4. Choose to login now or later
+5. Complete the OAuth flow via `/login`
+6. Models appear in `/model` as "GPT-5.2 (#2)", "Claude Sonnet 4.5 (#2)", etc.
+
+### Environment variable (alternative)
+
+For scripting or CI, set `MULTI_SUB`:
 
 ```bash
-export MULTI_SUB="openai-codex:1,anthropic:1"
+export MULTI_SUB="openai-codex:2,anthropic:1"
 ```
 
-This creates:
-- `openai-codex-2` -- a second Codex subscription with its own OAuth login
-- `anthropic-2` -- a second Anthropic subscription with its own OAuth login
-
-For more accounts, increase the count:
-
-```bash
-# 3 total Codex accounts (original + 2 extra)
-export MULTI_SUB="openai-codex:2"
-```
-
-This creates `openai-codex-2` and `openai-codex-3`.
+This creates `openai-codex-2`, `openai-codex-3`, and `anthropic-2`. Env-based entries are merged with saved config (no duplicates).
 
 ## Supported providers
 
@@ -47,36 +55,44 @@ This creates `openai-codex-2` and `openai-codex-3`.
 | `google-gemini-cli` | Google Cloud Code Assist | Browser + local callback |
 | `google-antigravity` | Antigravity (Gemini 3, Claude, GPT-OSS) | Browser + local callback |
 
-## Usage
-
-1. Set `MULTI_SUB` in your shell profile (`.bashrc`, `.zshrc`, etc.)
-2. Start pi
-3. Run `/login` and select the new provider (e.g., "ChatGPT Plus/Pro (Codex) #2")
-4. Complete the OAuth flow for your second account
-5. Use `/model` to switch between accounts -- models are suffixed with `(#2)`, `(#3)`, etc.
-
-Each account has independent OAuth tokens and rate limits, stored separately in `auth.json`.
-
 ## How it works
 
-- Dynamically clones models from the built-in provider using `getModels()`, so new models added in pi updates are picked up automatically
+- Subscriptions are saved in `~/.pi/agent/multi-pass.json`
+- Each extra subscription registers a new provider (e.g., `anthropic-2`) with its own OAuth flow and auth token
+- Models are cloned dynamically from the built-in provider via `getModels()`, so new models from pi updates appear automatically
 - Reuses the built-in OAuth login/refresh functions and API stream handlers
-- Each cloned provider gets a unique name (e.g., `anthropic-2`) with separate auth storage
 - GitHub Copilot's dynamic base URL (`modifyModels`) is handled correctly
-- If `MULTI_SUB` is unset, the extension does nothing
+- `MULTI_SUB` env var entries are merged additively with saved config
+
+## Config file
+
+`~/.pi/agent/multi-pass.json`:
+
+```json
+{
+  "subscriptions": [
+    { "provider": "openai-codex", "index": 2, "label": "work" },
+    { "provider": "openai-codex", "index": 3, "label": "personal" },
+    { "provider": "anthropic", "index": 2 }
+  ]
+}
+```
+
+You can edit this file directly. Changes take effect on next pi startup or `/reload`.
 
 ## Example
 
-```bash
-# Two Codex accounts + two Claude accounts + one extra Copilot
-export MULTI_SUB="openai-codex:2,anthropic:2,github-copilot:1"
-pi
 ```
+/subs add
+> Select provider: openai-codex -- ChatGPT Plus/Pro (Codex)
+> Label: work
+> Created ChatGPT Codex #2 (work). Login now? Yes
+> Use /login and select "ChatGPT Codex #2" to authenticate.
 
-This registers:
-- `openai-codex-2`, `openai-codex-3` with models like "GPT-5.2 (#2)", "GPT-5.2 (#3)"
-- `anthropic-2`, `anthropic-3` with models like "Claude Sonnet 4.5 (#2)", "Claude Sonnet 4.5 (#3)"
-- `github-copilot-2` with models like "Claude Sonnet 4.5 (#2)", "GPT-5.1 (#2)"
+/subs status
+> ChatGPT Codex #2 (work) | logged in (token expires in 47m) | 8 models | saved
+> Anthropic #2             | not logged in                    | 23 models | env
+```
 
 ## License
 
