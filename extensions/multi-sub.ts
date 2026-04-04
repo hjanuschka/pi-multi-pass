@@ -5100,6 +5100,21 @@ async function handleSubsMenu(
 // /mp-preset command handlers
 // ==========================================================================
 
+/** Pretty-print a preset entry using subscription labels when available. */
+function formatPresetEntry(entry: PresetEntry): string {
+	const config = loadGlobalConfig();
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const displayName = getProviderDisplayName(entry.provider, allSubs);
+	return `${displayName} / ${entry.model}`;
+}
+
+/** Lightweight version that takes pre-loaded subs to avoid re-reading config per entry. */
+function formatPresetEntryWith(entry: PresetEntry, allSubs: SubEntry[]): string {
+	const displayName = getProviderDisplayName(entry.provider, allSubs);
+	return `${displayName} / ${entry.model}`;
+}
+
 async function handlePresetCreate(
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
@@ -5126,7 +5141,7 @@ async function handlePresetCreate(
 	let adding = true;
 	while (adding) {
 		const providerOptions = [
-			`--- Entries (${entries.length}): ${entries.map((e) => `${e.provider}/${e.model}`).join(", ") || "none"} ---`,
+			`--- Entries (${entries.length}): ${entries.map((e) => formatPresetEntryWith(e, allSubs)).join(", ") || "none"} ---`,
 			...allProviders.map((p) => {
 				const template = PROVIDER_TEMPLATES[p];
 				const display = template?.displayName || p;
@@ -5178,7 +5193,7 @@ async function handlePresetCreate(
 	}
 	saveGlobalConfig(config);
 	ctx.ui.notify(
-		`Preset "${preset.name}" saved with ${entries.length} ${entries.length === 1 ? "entry" : "entries"}: ${entries.map((e) => `${e.provider}/${e.model}`).join(", ")}`,
+		`Preset "${preset.name}" saved with ${entries.length} ${entries.length === 1 ? "entry" : "entries"}: ${entries.map((e) => formatPresetEntryWith(e, allSubs)).join(", ")}`,
 		"info",
 	);
 }
@@ -5190,10 +5205,12 @@ async function handlePresetList(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
 	const items: SelectItem[] = config.presets.map((preset) => ({
 		value: preset.name,
 		label: `${preset.enabled ? "+" : "-"} ${preset.name}`,
-		description: preset.entries.map((e) => `${e.provider}/${e.model}`).join(" -> "),
+		description: preset.entries.map((e) => formatPresetEntryWith(e, allSubs)).join(" -> "),
 	}));
 
 	await showWrappedSelect(ctx, {
@@ -5211,6 +5228,8 @@ async function handlePresetActivate(
 	requestedName?: string,
 ): Promise<void> {
 	const config = loadGlobalConfig();
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
 	const enabled = config.presets.filter((p) => p.enabled);
 	if (enabled.length === 0) {
 		ctx.ui.notify("No enabled presets. Use /mp-preset create to add one.", "info");
@@ -5225,7 +5244,7 @@ async function handlePresetActivate(
 			items: enabled.map((p) => ({
 				value: p.name,
 				label: p.name,
-				description: p.entries.filter((e) => e.enabled).map((e) => `${e.provider}/${e.model}`).join(" -> "),
+				description: p.entries.filter((e) => e.enabled).map((e) => formatPresetEntryWith(e, allSubs)).join(" -> "),
 			})),
 			confirmHint: "activate",
 			cancelHint: "back",
@@ -5248,8 +5267,9 @@ async function handlePresetActivate(
 		const success = await pi.setModel(model);
 		if (!success) continue;
 
-		ctx.ui.notify(`Preset "${preset.name}": switched to ${entry.provider}/${entry.model}`, "info");
-		ctx.ui.setStatus("multi-pass", `preset:${preset.name} | ${entry.provider}/${entry.model}`);
+		const prettyEntry = formatPresetEntryWith(entry, allSubs);
+		ctx.ui.notify(`Preset "${preset.name}": switched to ${prettyEntry}`, "info");
+		ctx.ui.setStatus("multi-pass", `preset:${preset.name} | ${prettyEntry}`);
 		return;
 	}
 
