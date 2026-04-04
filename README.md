@@ -20,11 +20,11 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
-- **Model presets**: Named routing shortcuts across providers (`/preset coding-premium`)
+- **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
-- **TUI management**: `/subs`, `/pool`, and `/preset` commands -- no config files needed
+- **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
 - **Labels**: Tag subscriptions (e.g. "work", "personal")
 
 ## Quick start
@@ -36,8 +36,8 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 /subs limits           Check built-in quota support (Codex + Google)
 /pool create           Group subs into a rotation pool (with strategy selection)
 /pool chain create     Build an ordered fallback chain across pools
-/preset create         Create a named routing preset across providers
-/preset coding-premium Activate a preset by name
+/mp-preset create         Create a named routing preset across providers
+/mp-preset coding-premium Activate a preset by name
 ```
 
 When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
@@ -82,16 +82,16 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /pool chain status      Inspect chain entries and validity
 ```
 
-### `/preset` -- Model presets (named routing)
+### `/mp-preset` -- Model presets (named routing)
 
 ```
-/preset                 Open menu
-/preset activate        Switch to a preset's best available entry
-/preset <name>          Activate a preset by name directly
-/preset create          Create a new preset
-/preset list            Show all presets
-/preset toggle          Enable/disable a preset
-/preset remove          Delete a preset
+/mp-preset                 Open menu
+/mp-preset activate        Switch to a preset's best available entry
+/mp-preset <name>          Activate a preset by name directly
+/mp-preset create          Create a new preset
+/mp-preset list            Show all presets
+/mp-preset toggle          Enable/disable a preset
+/mp-preset remove          Delete a preset
 ```
 
 ## Project-level configuration
@@ -292,26 +292,26 @@ Presets are named routing shortcuts that map to an ordered list of provider+mode
 ### Commands
 
 ```
-/preset              Open menu
-/preset activate     Switch to a preset's best available entry
-/preset <name>       Activate a preset by name directly
-/preset create       Create a new preset
-/preset list         Show all presets
-/preset toggle       Enable/disable a preset
-/preset remove       Delete a preset
+/mp-preset              Open menu
+/mp-preset activate     Switch to a preset's best available entry
+/mp-preset <name>       Activate a preset by name directly
+/mp-preset create       Create a new preset
+/mp-preset list         Show all presets
+/mp-preset toggle       Enable/disable a preset
+/mp-preset remove       Delete a preset
 ```
 
 ### Example
 
 ```
-/preset create
+/mp-preset create
   Name: coding-premium
   Entries:
     1. anthropic / claude-sonnet-4-20250514
     2. openai-codex / o3
     3. google-gemini-cli / gemini-2.5-pro
 
-/preset coding-premium
+/mp-preset coding-premium
   -> Tries anthropic first. If not logged in, tries openai-codex. Then gemini.
 ```
 

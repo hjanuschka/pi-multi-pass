@@ -5097,7 +5097,7 @@ async function handleSubsMenu(
 }
 
 // ==========================================================================
-// /preset command handlers
+// /mp-preset command handlers
 // ==========================================================================
 
 async function handlePresetCreate(
@@ -5186,7 +5186,7 @@ async function handlePresetCreate(
 async function handlePresetList(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	if (config.presets.length === 0) {
-		ctx.ui.notify("No presets configured. Use /preset create to add one.", "info");
+		ctx.ui.notify("No presets configured. Use /mp-preset create to add one.", "info");
 		return;
 	}
 
@@ -5213,7 +5213,7 @@ async function handlePresetActivate(
 	const config = loadGlobalConfig();
 	const enabled = config.presets.filter((p) => p.enabled);
 	if (enabled.length === 0) {
-		ctx.ui.notify("No enabled presets. Use /preset create to add one.", "info");
+		ctx.ui.notify("No enabled presets. Use /mp-preset create to add one.", "info");
 		return;
 	}
 
@@ -5621,9 +5621,9 @@ export default function multiSub(pi: ExtensionAPI) {
 		},
 	});
 
-	// Register /preset command
-	pi.registerCommand("preset", {
-		description: "Manage model presets (named routing shortcuts across providers)",
+	// Register /mp-preset command (namespaced to avoid collision with pi's built-in /preset)
+	pi.registerCommand("mp-preset", {
+		description: "Manage multi-pass model presets (named routing shortcuts across providers)",
 		getArgumentCompletions: (prefix: string) => {
 			const subcommands = ["activate", "create", "list", "toggle", "remove"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
