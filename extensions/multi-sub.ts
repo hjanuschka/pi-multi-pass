@@ -1420,6 +1420,13 @@ interface SubEntry {
 	label?: string;
 }
 
+/** Pool member selection strategy.
+ *  - "round-robin": rotate sequentially through members (default).
+ *  - "quota-first": query built-in quota checkers and prefer the member
+ *    with the most remaining quota. Falls back to round-robin when no
+ *    quota data is available. */
+type PoolStrategy = "round-robin" | "quota-first";
+
 interface PoolConfig {
 	/** Pool name (user-defined) */
 	name: string;
@@ -1430,6 +1437,9 @@ interface PoolConfig {
 	members: string[];
 	/** Whether auto-rotation is enabled */
 	enabled: boolean;
+	/** Selection strategy when picking the next member on failover.
+	 *  Defaults to "round-robin" when omitted. */
+	strategy?: PoolStrategy;
 }
 
 interface ChainEntryConfig {
@@ -2138,6 +2148,47 @@ class PoolManager {
 		return undefined;
 	}
 
+	/**
+	 * Pick the best member using built-in quota checkers.
+	 * Returns the provider name with the highest remaining quota,
+	 * or undefined if no quota data is available (caller should
+	 * fall back to round-robin).
+	 */
+	async getQuotaBestMember(
+		pool: PoolConfig,
+		currentProvider: string,
+		authStorage: { hasAuth(provider: string): boolean; get(provider: string): unknown },
+		excludeProviders?: Set<string>,
+	): Promise<string | undefined> {
+		const available = this.getAvailableMembers(pool, authStorage);
+		const eligible = available.filter(
+			(member) => member !== currentProvider && !(excludeProviders?.has(member)),
+		);
+		if (eligible.length === 0) return undefined;
+		// If only one candidate, skip the network calls.
+		if (eligible.length === 1) return eligible[0];
+
+		const accounts: QuotaAccount[] = eligible.map((providerName) => ({
+			providerName,
+			baseProvider: getBaseProvider(providerName) || providerName,
+			displayName: providerName,
+			auth: authStorage.get(providerName) as AuthStorageEntry | undefined,
+		}));
+
+		try {
+			const results = await runQuotaChecks(accounts);
+			if (results.length === 0) return undefined;
+			// runQuotaChecks returns sorted best-first.
+			const best = results[0];
+			// Only use quota selection when the best result has real data.
+			if (best.kind === "error" || best.kind === "missing-auth") return undefined;
+			return best.account.providerName;
+		} catch {
+			// Network failure etc. -- fall back to round-robin.
+			return undefined;
+		}
+	}
+
 	private ensureCascadeState(prompt: string | null, currentModel: Model<Api>): FailoverCascadeState {
 		if (!prompt) {
 			const fallbackState: FailoverCascadeState = {
@@ -2231,6 +2282,40 @@ class PoolManager {
 				visitedChainIndexes: cascade.visitedChainIndexes,
 			},
 		);
+
+		// When the pool uses "quota-first" strategy, reorder same-pool
+		// candidates by remaining quota so the healthiest member goes first.
+		if (pool.strategy === "quota-first" && plan.candidates.length > 1) {
+			const poolCandidates = plan.candidates.filter(
+				(c) => c.source === "pool" && c.poolName === pool.name,
+			);
+			if (poolCandidates.length > 1) {
+				try {
+					const best = await this.getQuotaBestMember(
+						pool,
+						currentModel.provider,
+						ctx.modelRegistry.authStorage,
+						cascade.attemptedProviders,
+					);
+					if (best) {
+						const bestIdx = plan.candidates.findIndex(
+							(c) => c.provider === best && c.source === "pool",
+						);
+						if (bestIdx > 0) {
+							const [moved] = plan.candidates.splice(bestIdx, 1);
+							plan.candidates.unshift(moved);
+							ctx.ui.notify(
+								`[pool:${pool.name}] quota-first: ${best} has the most remaining quota`,
+								"info",
+							);
+						}
+					}
+				} catch {
+					// Quota check failed -- proceed with default order.
+				}
+			}
+		}
+
 		const continuation = formatFailoverContinuation(plan.candidates[0]);
 		for (const skip of plan.skips) {
 			ctx.ui.notify(
@@ -2874,6 +2959,7 @@ function buildPoolConfig(input: {
 	baseProvider: string;
 	members: string[];
 	enabled?: boolean;
+	strategy?: PoolStrategy;
 }): { ok: true; pool: PoolConfig } | { ok: false; error: string } {
 	const name = input.name.trim();
 	if (!name) {
@@ -2883,15 +2969,16 @@ function buildPoolConfig(input: {
 	if (validation) {
 		return { ok: false, error: validation };
 	}
-	return {
-		ok: true,
-		pool: {
-			name,
-			baseProvider: input.baseProvider,
-			members: [...input.members],
-			enabled: input.enabled ?? true,
-		},
+	const pool: PoolConfig = {
+		name,
+		baseProvider: input.baseProvider,
+		members: [...input.members],
+		enabled: input.enabled ?? true,
 	};
+	if (input.strategy && input.strategy !== "round-robin") {
+		pool.strategy = input.strategy;
+	}
+	return { ok: true, pool };
 }
 
 function persistPoolConfig(
@@ -3147,7 +3234,15 @@ async function promptForPoolDefinition(
 		}
 	}
 
-	const built = buildPoolConfig({ name: poolName, baseProvider, members, enabled: true });
+	// Ask for selection strategy
+	const strategyItems = [
+		"round-robin -- Rotate members sequentially (default)",
+		"quota-first -- Prefer the member with the most remaining quota",
+	];
+	const strategyPick = await ctx.ui.select("Selection strategy", strategyItems);
+	const strategy: PoolStrategy = strategyPick?.startsWith("quota-first") ? "quota-first" : "round-robin";
+
+	const built = buildPoolConfig({ name: poolName, baseProvider, members, enabled: true, strategy });
 	if (!built.ok) {
 		ctx.ui.notify(built.error, "warning");
 		return undefined;
@@ -3287,6 +3382,52 @@ async function togglePoolConfig(
 	ctx.ui.notify(`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`, "info");
 }
 
+async function changePoolStrategy(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	config: MultiPassConfig,
+	pool: PoolConfig,
+): Promise<void> {
+	const current = pool.strategy || "round-robin";
+	const items: SelectItem[] = [
+		{
+			value: "round-robin",
+			label: "round-robin",
+			description: "Rotate members sequentially (default)",
+		},
+		{
+			value: "quota-first",
+			label: "quota-first",
+			description: "Prefer the member with the most remaining quota",
+		},
+	];
+
+	const selected = await showWrappedSelect(ctx, {
+		title: `Strategy: ${pool.name}`,
+		subtitle: `Currently: ${current}`,
+		items,
+		initialValue: current,
+		confirmHint: "select",
+		cancelHint: "back",
+	});
+	if (!selected) return;
+
+	const nextStrategy = selected as PoolStrategy;
+	if (nextStrategy === current) {
+		ctx.ui.notify(`Strategy unchanged (${current}).`, "info");
+		return;
+	}
+
+	if (nextStrategy === "round-robin") {
+		delete pool.strategy;
+	} else {
+		pool.strategy = nextStrategy;
+	}
+	saveGlobalConfig(config);
+	reloadPoolManagerForCurrentProject(ctx, poolManager);
+	ctx.ui.notify(`Pool "${pool.name}" strategy changed to ${nextStrategy}.`, "info");
+}
+
 async function removePoolConfig(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
@@ -3330,6 +3471,7 @@ async function showPoolActions(
 	config: MultiPassConfig,
 	pool: PoolConfig,
 ): Promise<"removed" | undefined> {
+	const currentStrategy = pool.strategy || "round-robin";
 	const action = await showWrappedSelect(ctx, {
 		title: pool.name,
 		subtitle: "Escape returns to the pools list.",
@@ -3337,6 +3479,11 @@ async function showPoolActions(
 			{ value: "inspect", label: "inspect", description: "View pool health and member status" },
 			{ value: "rename", label: "rename", description: "Change pool name" },
 			{ value: "members", label: "members", description: "Add or remove pool members" },
+			{
+				value: "strategy",
+				label: "strategy",
+				description: `Currently ${currentStrategy}`,
+			},
 			{
 				value: "toggle",
 				label: pool.enabled ? "disable" : "enable",
@@ -3359,6 +3506,10 @@ async function showPoolActions(
 	}
 	if (action === "members") {
 		await editPoolMembers(ctx, poolManager, config, pool);
+		return undefined;
+	}
+	if (action === "strategy") {
+		await changePoolStrategy(ctx, poolManager, config, pool);
 		return undefined;
 	}
 	if (action === "toggle") {
@@ -3518,9 +3669,11 @@ function formatPoolStatusLines(
 	poolManager: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
 ): string[] {
 	const summary = summarizePoolHealth(pool, authStorage, poolManager);
+	const strategy = pool.strategy || "round-robin";
 	const lines = [
 		`=== ${pool.name} (${pool.enabled ? "enabled" : "disabled"}) ===`,
 		`provider: ${pool.baseProvider}`,
+		`strategy: ${strategy}`,
 		`members: ${summary.memberCount}`,
 		`availability: ${summary.statusLabel}`,
 	];

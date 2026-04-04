@@ -149,6 +149,33 @@ cd ~/side-project
 4. Retries your last prompt automatically
 5. After a 5-minute cooldown, `openai-codex` becomes available again
 
+### Pool selection strategy
+
+Each pool has a `strategy` that controls how the next member is chosen on failover:
+
+| Strategy | Behavior |
+|---|---|
+| `round-robin` | Rotate sequentially through members (default) |
+| `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota. Falls back to round-robin when no quota data is available. |
+
+Set the strategy during pool creation (`/pool create`) or change it later via `/pool list` -> select pool -> `strategy`.
+
+**`quota-first` example**: you have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
+
+This uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers). For providers without a built-in quota checker, `quota-first` falls back to round-robin.
+
+Pool strategy is stored in `multi-pass.json`:
+
+```json
+{
+  "name": "codex-pool",
+  "baseProvider": "openai-codex",
+  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
+  "enabled": true,
+  "strategy": "quota-first"
+}
+```
+
 ## How chains work
 
 1. You define an ordered chain of pool/model entries (for example `primary -> backup -> solo`)
@@ -179,7 +206,9 @@ Currently implemented:
 
 Google quota is not a single flat subscription bucket, so the details view shows one line per returned Gemini family or Antigravity model with its remaining headroom and reset time.
 
-`/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now, but it does not proactively switch models by itself. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
+`/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
+
+When a pool uses the `quota-first` strategy, the same quota checkers are used automatically during failover to pick the healthiest member instead of just round-robin.
 
 When a project defines `.pi/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
 
