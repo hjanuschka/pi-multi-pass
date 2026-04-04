@@ -18,11 +18,13 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
+- **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
+- **Model presets**: Named routing shortcuts across providers (`/preset coding-premium`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
-- **TUI management**: `/subs` and `/pool` commands -- no config files needed
+- **TUI management**: `/subs`, `/pool`, and `/preset` commands -- no config files needed
 - **Labels**: Tag subscriptions (e.g. "work", "personal")
 
 ## Quick start
@@ -32,8 +34,10 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 /login                 Authenticate the new subscription
 /subs switch           Manually switch to another subscription/provider
 /subs limits           Check built-in quota support (Codex + Google)
-/pool create           Group subs into a rotation pool
+/pool create           Group subs into a rotation pool (with strategy selection)
 /pool chain create     Build an ordered fallback chain across pools
+/preset create         Create a named routing preset across providers
+/preset coding-premium Activate a preset by name
 ```
 
 When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
@@ -76,6 +80,18 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /pool chain toggle      Enable/disable a chain
 /pool chain remove      Delete a chain
 /pool chain status      Inspect chain entries and validity
+```
+
+### `/preset` -- Model presets (named routing)
+
+```
+/preset                 Open menu
+/preset activate        Switch to a preset's best available entry
+/preset <name>          Activate a preset by name directly
+/preset create          Create a new preset
+/preset list            Show all presets
+/preset toggle          Enable/disable a preset
+/preset remove          Delete a preset
 ```
 
 ## Project-level configuration
@@ -156,15 +172,19 @@ Each pool has a `strategy` that controls how the next member is chosen on failov
 | Strategy | Behavior |
 |---|---|
 | `round-robin` | Rotate sequentially through members (default) |
-| `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota. Falls back to round-robin when no quota data is available. |
+| `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota |
+| `scheduled` | Use per-member time windows and priority roles |
+| `custom` | Delegate to a user-provided JS selector script |
 
 Set the strategy during pool creation (`/pool create`) or change it later via `/pool list` -> select pool -> `strategy`.
 
-**`quota-first` example**: you have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
+All strategies fall back to round-robin when their specific data is unavailable.
 
-This uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers). For providers without a built-in quota checker, `quota-first` falls back to round-robin.
+#### `quota-first`
 
-Pool strategy is stored in `multi-pass.json`:
+You have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
+
+Uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers).
 
 ```json
 {
@@ -176,6 +196,87 @@ Pool strategy is stored in `multi-pass.json`:
 }
 ```
 
+#### `scheduled`
+
+Assign each member a role and optional time windows:
+
+- **preferred**: only used during its active windows. When multiple preferred members are active, the one whose window ends soonest goes first (burn that quota before the window closes).
+- **default** (no role): always available, used after preferred members.
+- **overflow**: last resort, used when preferred and default members are exhausted.
+
+```json
+{
+  "name": "codex-pool",
+  "baseProvider": "openai-codex",
+  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
+  "enabled": true,
+  "strategy": "scheduled",
+  "memberSchedule": {
+    "openai-codex": {
+      "role": "preferred",
+      "windows": [{ "hours": [9, 17], "days": ["mon", "tue", "wed", "thu", "fri"] }]
+    },
+    "openai-codex-2": {
+      "role": "preferred",
+      "windows": [{ "hours": [17, 9] }]
+    },
+    "openai-codex-3": {
+      "role": "overflow"
+    }
+  }
+}
+```
+
+Window format:
+- `hours`: `[start, end)` in 24h local time. Wraps midnight when start > end (e.g. `[22, 6]` = 22:00-05:59).
+- `days`: array of `"mon"`, `"tue"`, ..., `"sun"`. Omit for every day.
+- `dateRange`: `{ "from": "2025-06-01", "to": "2025-06-30" }` for temporary windows.
+
+During pool creation or via the `strategy` quick action, you can configure schedules interactively with human-friendly input like `9-17 mon-fri`.
+
+#### `custom`
+
+Point to a JS script that decides which member to try first. The script receives full context and returns the preferred provider name (or an ordered array).
+
+```json
+{
+  "name": "codex-pool",
+  "baseProvider": "openai-codex",
+  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
+  "enabled": true,
+  "strategy": "custom",
+  "selectorScript": "selectors/my-codex-selector.js"
+}
+```
+
+Script paths are resolved relative to `~/.pi/agent/`. Absolute paths and `~/` paths also work.
+
+**Selector script interface:**
+
+```js
+// ~/.pi/agent/selectors/my-codex-selector.js
+module.exports = async function select(ctx) {
+  // ctx.members:         string[]  -- available (non-exhausted, authenticated) members
+  // ctx.currentProvider: string    -- the provider that just hit a rate limit
+  // ctx.modelId:         string    -- the model ID being used
+  // ctx.pool:            object    -- { name, baseProvider, members }
+  // ctx.timestamp:       number    -- current Unix timestamp (ms)
+  // ctx.hour:            number    -- current hour (0-23, local time)
+  // ctx.day:             string    -- current day of week ("mon".."sun")
+  // ctx.prompt:          string?   -- last user prompt, if available
+  //
+  // Return: string (provider name), string[] (ordered preference), or undefined (fall back)
+
+  // Example: prefer a specific account during business hours
+  if (ctx.hour >= 9 && ctx.hour < 17) {
+    return ctx.members.find(m => m === "openai-codex-2");
+  }
+  return ctx.members[0];
+};
+```
+
+If the script throws, returns an invalid provider name, or the file is missing, the pool falls back to round-robin.
+
 ## How chains work
 
 1. You define an ordered chain of pool/model entries (for example `primary -> backup -> solo`)
@@ -183,6 +284,66 @@ Pool strategy is stored in `multi-pass.json`:
 3. It skips disabled or invalid entries and reports why in warnings
 4. During retry replays for the same prompt, it preserves cascade state and avoids re-trying already attempted providers
 5. Session status shows the active chain start entry: `chain:<name> | starts <pool> -> <model>`
+
+## Model presets
+
+Presets are named routing shortcuts that map to an ordered list of provider+model entries across different providers. Think of them as intent-based routing: `coding-premium`, `coding-budget`, `fastest`, etc.
+
+### Commands
+
+```
+/preset              Open menu
+/preset activate     Switch to a preset's best available entry
+/preset <name>       Activate a preset by name directly
+/preset create       Create a new preset
+/preset list         Show all presets
+/preset toggle       Enable/disable a preset
+/preset remove       Delete a preset
+```
+
+### Example
+
+```
+/preset create
+  Name: coding-premium
+  Entries:
+    1. anthropic / claude-sonnet-4-20250514
+    2. openai-codex / o3
+    3. google-gemini-cli / gemini-2.5-pro
+
+/preset coding-premium
+  -> Tries anthropic first. If not logged in, tries openai-codex. Then gemini.
+```
+
+### Config
+
+Presets are stored in `~/.pi/agent/multi-pass.json`:
+
+```json
+{
+  "presets": [
+    {
+      "name": "coding-premium",
+      "enabled": true,
+      "entries": [
+        { "provider": "anthropic", "model": "claude-sonnet-4-20250514", "enabled": true },
+        { "provider": "openai-codex", "model": "o3", "enabled": true },
+        { "provider": "google-gemini-cli", "model": "gemini-2.5-pro", "enabled": true }
+      ]
+    },
+    {
+      "name": "coding-budget",
+      "enabled": true,
+      "entries": [
+        { "provider": "openai-codex", "model": "gpt-4.1-mini", "enabled": true },
+        { "provider": "google-gemini-cli", "model": "gemini-2.5-flash", "enabled": true }
+      ]
+    }
+  ]
+}
+```
+
+Presets work with pools: if an entry's provider belongs to a pool, rate-limit failover still rotates within that pool before trying the next preset entry.
 
 ## Supported providers
 

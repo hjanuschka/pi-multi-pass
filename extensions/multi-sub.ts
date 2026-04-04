@@ -1424,8 +1424,80 @@ interface SubEntry {
  *  - "round-robin": rotate sequentially through members (default).
  *  - "quota-first": query built-in quota checkers and prefer the member
  *    with the most remaining quota. Falls back to round-robin when no
- *    quota data is available. */
-type PoolStrategy = "round-robin" | "quota-first";
+ *    quota data is available.
+ *  - "scheduled": use per-member time-window schedules to pick the best
+ *    member. Preferred members in their active window go first (shortest
+ *    remaining window first), then default members, then overflow.
+ *  - "custom": delegate selection to a user-provided JS script. */
+type PoolStrategy = "round-robin" | "quota-first" | "scheduled" | "custom";
+
+type DayOfWeek = "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+const ALL_DAYS: readonly DayOfWeek[] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] as const;
+
+/** A time window during which a pool member is considered "preferred". */
+interface ScheduleWindow {
+	/** Hour range [start, end) in 24-hour local time. Wraps midnight
+	 *  when start > end (e.g. [22, 6] = 22:00-05:59). */
+	hours?: [number, number];
+	/** Days of week this window is active. Omit for every day. */
+	days?: DayOfWeek[];
+	/** Optional date range (ISO date strings YYYY-MM-DD, inclusive). */
+	dateRange?: { from?: string; to?: string };
+}
+
+/** Per-member schedule configuration. */
+interface MemberSchedule {
+	/** Time windows when this member is preferred. */
+	windows?: ScheduleWindow[];
+	/** Role controls ordering priority:
+	 *  - "preferred": used during its active windows, skipped otherwise
+	 *  - "overflow": last resort, used when no preferred/default member is available
+	 *  - undefined (default): always available, used after preferred members */
+	role?: "preferred" | "overflow";
+}
+
+/** Context passed to a custom pool selector script. */
+interface PoolSelectorContext {
+	/** Available (non-exhausted, authenticated) member provider names */
+	members: string[];
+	/** Provider that just hit the rate limit */
+	currentProvider: string;
+	/** Model ID being used */
+	modelId: string;
+	/** Pool metadata */
+	pool: { name: string; baseProvider: string; members: string[] };
+	/** Current Unix timestamp (ms) */
+	timestamp: number;
+	/** Current hour (0-23, local time) */
+	hour: number;
+	/** Current day of week */
+	day: DayOfWeek;
+	/** Last user prompt, if available */
+	prompt?: string;
+}
+
+/** Function signature a custom selector script must export (default export). */
+type PoolSelectorFn =
+	(ctx: PoolSelectorContext) => string | string[] | undefined | Promise<string | string[] | undefined>;
+
+/** A named routing preset that maps to an ordered list of provider+model entries. */
+interface PresetEntry {
+	/** Provider name (e.g. "openai-codex", "anthropic-2") */
+	provider: string;
+	/** Model ID to use */
+	model: string;
+	/** Whether this entry is active */
+	enabled: boolean;
+}
+
+interface PresetConfig {
+	/** Preset name (e.g. "coding-premium", "coding-budget") */
+	name: string;
+	/** Ordered provider+model entries to try */
+	entries: PresetEntry[];
+	/** Whether this preset is available */
+	enabled: boolean;
+}
 
 interface PoolConfig {
 	/** Pool name (user-defined) */
@@ -1440,6 +1512,13 @@ interface PoolConfig {
 	/** Selection strategy when picking the next member on failover.
 	 *  Defaults to "round-robin" when omitted. */
 	strategy?: PoolStrategy;
+	/** Per-member schedule rules (keyed by provider name).
+	 *  Only used when strategy is "scheduled". */
+	memberSchedule?: Record<string, MemberSchedule>;
+	/** Path to a JS module exporting a selector function.
+	 *  Only used when strategy is "custom". Resolved relative to the
+	 *  global config directory (~/.pi/agent/). */
+	selectorScript?: string;
 }
 
 interface ChainEntryConfig {
@@ -1464,6 +1543,7 @@ interface MultiPassConfig {
 	subscriptions: SubEntry[];
 	pools: PoolConfig[];
 	chains: ChainConfig[];
+	presets: PresetConfig[];
 }
 
 /** Project-level config (.pi/multi-pass.json) */
@@ -1483,6 +1563,7 @@ interface EffectiveConfig {
 	subscriptions: SubEntry[];
 	pools: PoolConfig[];
 	chains: ChainConfig[];
+	presets: PresetConfig[];
 	/** Exact provider names allowed in this project, if restricted. */
 	allowedProviderNames?: string[];
 	/** Which project config was loaded from, if any */
@@ -1498,7 +1579,7 @@ function projectConfigPath(cwd: string): string {
 }
 
 function emptyMultiPassConfig(): MultiPassConfig {
-	return { subscriptions: [], pools: [], chains: [] };
+	return { subscriptions: [], pools: [], chains: [], presets: [] };
 }
 
 function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
@@ -1507,6 +1588,7 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 		subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
 		pools: Array.isArray(parsed.pools) ? parsed.pools : [],
 		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
+		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
 	};
 }
 
@@ -1583,6 +1665,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 			subscriptions: mergedSubscriptions,
 			pools: global.pools,
 			chains: global.chains,
+			presets: global.presets,
 		};
 	}
 
@@ -1604,6 +1687,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 		subscriptions: subs,
 		pools,
 		chains,
+		presets: global.presets,
 		allowedProviderNames,
 		projectConfigPath: projectConfigPath(cwd),
 	};
@@ -1847,6 +1931,203 @@ const RATE_LIMIT_PATTERNS = [
 function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
 }
+
+// ==========================================================================
+// Schedule evaluation helpers
+// ==========================================================================
+
+const JS_DAY_TO_DOW: DayOfWeek[] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+function getDayOfWeek(date: Date): DayOfWeek {
+	return JS_DAY_TO_DOW[date.getDay()];
+}
+
+function isInHourRange(hour: number, range: [number, number]): boolean {
+	const [start, end] = range;
+	if (start <= end) {
+		// Normal range, e.g. [9, 17] = 09:00-16:59
+		return hour >= start && hour < end;
+	}
+	// Wrapping range, e.g. [22, 6] = 22:00-05:59
+	return hour >= start || hour < end;
+}
+
+function isInDateRange(date: Date, range: { from?: string; to?: string }): boolean {
+	const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+	if (range.from && dateStr < range.from) return false;
+	if (range.to && dateStr > range.to) return false;
+	return true;
+}
+
+function isInScheduleWindow(window: ScheduleWindow, now: Date): boolean {
+	if (window.days && window.days.length > 0) {
+		if (!window.days.includes(getDayOfWeek(now))) return false;
+	}
+	if (window.hours) {
+		if (!isInHourRange(now.getHours(), window.hours)) return false;
+	}
+	if (window.dateRange) {
+		if (!isInDateRange(now, window.dateRange)) return false;
+	}
+	return true;
+}
+
+/** Calculate ms until the current window closes. Returns Infinity if window
+ *  has no hour constraint (open-ended). */
+function getWindowRemainingMs(window: ScheduleWindow, now: Date): number {
+	if (!window.hours) return Infinity;
+	const [, end] = window.hours;
+	const endToday = new Date(now);
+	endToday.setHours(end, 0, 0, 0);
+	let remaining = endToday.getTime() - now.getTime();
+	if (remaining <= 0) {
+		// End is tomorrow (wrapped range like [22, 6])
+		remaining += 24 * 60 * 60 * 1000;
+	}
+	return remaining;
+}
+
+interface ScheduledMemberState {
+	provider: string;
+	role: "preferred" | "default" | "overflow";
+	active: boolean;
+	shortestRemainingMs: number;
+}
+
+function getScheduledMemberState(
+	provider: string,
+	schedule: MemberSchedule | undefined,
+	now: Date,
+): ScheduledMemberState {
+	if (!schedule) {
+		return { provider, role: "default", active: true, shortestRemainingMs: Infinity };
+	}
+	const role: "preferred" | "default" | "overflow" = schedule.role || "default";
+	if (role === "overflow") {
+		return { provider, role, active: true, shortestRemainingMs: Infinity };
+	}
+
+	const windows = schedule.windows || [];
+	if (windows.length === 0) {
+		return { provider, role, active: true, shortestRemainingMs: Infinity };
+	}
+
+	let anyActive = false;
+	let shortestRemainingMs = Infinity;
+	for (const w of windows) {
+		if (isInScheduleWindow(w, now)) {
+			anyActive = true;
+			const remaining = getWindowRemainingMs(w, now);
+			if (remaining < shortestRemainingMs) shortestRemainingMs = remaining;
+		}
+	}
+
+	return { provider, role, active: anyActive, shortestRemainingMs };
+}
+
+/** Sort available members by schedule priority:
+ *  1. Preferred members in their active window (shortest remaining first)
+ *  2. Default members (always available)
+ *  3. Overflow members (last resort) */
+function getScheduledMemberOrder(
+	pool: PoolConfig,
+	available: string[],
+	now: Date,
+): string[] {
+	const memberSchedule = pool.memberSchedule || {};
+	const states = available.map((provider) =>
+		getScheduledMemberState(provider, memberSchedule[provider], now),
+	);
+
+	const preferred = states
+		.filter((s) => s.role === "preferred" && s.active)
+		.sort((a, b) => a.shortestRemainingMs - b.shortestRemainingMs);
+	const defaults = states.filter((s) => s.role === "default");
+	const overflow = states.filter((s) => s.role === "overflow");
+	// Preferred members NOT in their window are skipped entirely
+	return [...preferred, ...defaults, ...overflow].map((s) => s.provider);
+}
+
+// ==========================================================================
+// Custom selector script loader
+// ==========================================================================
+
+const selectorCache = new Map<string, PoolSelectorFn | null>();
+
+function resolveSelectorScriptPath(scriptPath: string): string {
+	if (scriptPath.startsWith("/")) return scriptPath;
+	if (scriptPath.startsWith("~/")) {
+		const home = process.env.HOME || process.env.USERPROFILE || "";
+		return join(home, scriptPath.slice(2));
+	}
+	// Resolve relative to global config directory
+	return join(getAgentDir(), scriptPath);
+}
+
+async function loadSelectorScript(scriptPath: string): Promise<PoolSelectorFn | null> {
+	const resolved = resolveSelectorScriptPath(scriptPath);
+	const cached = selectorCache.get(resolved);
+	if (cached !== undefined) return cached;
+
+	if (!existsSync(resolved)) {
+		selectorCache.set(resolved, null);
+		return null;
+	}
+
+	try {
+		const mod = await import(resolved);
+		const fn: PoolSelectorFn = typeof mod.default === "function"
+			? mod.default
+			: typeof mod === "function"
+				? mod
+				: null;
+		selectorCache.set(resolved, fn);
+		return fn;
+	} catch {
+		selectorCache.set(resolved, null);
+		return null;
+	}
+}
+
+async function runCustomSelector(
+	pool: PoolConfig,
+	available: string[],
+	currentProvider: string,
+	modelId: string,
+	prompt?: string,
+): Promise<string | undefined> {
+	if (!pool.selectorScript) return undefined;
+	const fn = await loadSelectorScript(pool.selectorScript);
+	if (!fn) return undefined;
+
+	const now = new Date();
+	const ctx: PoolSelectorContext = {
+		members: [...available],
+		currentProvider,
+		modelId,
+		pool: { name: pool.name, baseProvider: pool.baseProvider, members: [...pool.members] },
+		timestamp: now.getTime(),
+		hour: now.getHours(),
+		day: getDayOfWeek(now),
+		prompt,
+	};
+
+	try {
+		const result = await fn(ctx);
+		if (typeof result === "string" && available.includes(result)) return result;
+		if (Array.isArray(result)) {
+			const first = result.find((r) => typeof r === "string" && available.includes(r));
+			if (first) return first;
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+// ==========================================================================
+// Pool rotation engine
+// ==========================================================================
 
 interface PoolState {
 	/** Current index into pool.members */
@@ -2189,6 +2470,107 @@ class PoolManager {
 		}
 	}
 
+	/**
+	 * Reorder failover plan candidates based on the pool's strategy.
+	 * Mutates plan.candidates in place.
+	 */
+	private async reorderCandidatesByStrategy(
+		pool: PoolConfig,
+		plan: FailoverPlan,
+		currentModel: Model<Api>,
+		ctx: ExtensionContext,
+		cascade: FailoverCascadeState,
+		lastUserPrompt: string | null,
+	): Promise<void> {
+		const strategy = pool.strategy || "round-robin";
+		if (strategy === "round-robin") return;
+
+		const poolCandidates = plan.candidates.filter(
+			(c) => c.source === "pool" && c.poolName === pool.name,
+		);
+		if (poolCandidates.length < 2 && strategy !== "custom") return;
+
+		if (strategy === "quota-first") {
+			try {
+				const best = await this.getQuotaBestMember(
+					pool,
+					currentModel.provider,
+					ctx.modelRegistry.authStorage,
+					cascade.attemptedProviders,
+				);
+				if (best) {
+					const bestIdx = plan.candidates.findIndex(
+						(c) => c.provider === best && c.source === "pool",
+					);
+					if (bestIdx > 0) {
+						const [moved] = plan.candidates.splice(bestIdx, 1);
+						plan.candidates.unshift(moved);
+						ctx.ui.notify(
+							`[pool:${pool.name}] quota-first: ${best} has the most remaining quota`,
+							"info",
+						);
+					}
+				}
+			} catch {
+				// Quota check failed -- proceed with default order.
+			}
+			return;
+		}
+
+		if (strategy === "scheduled") {
+			const available = poolCandidates.map((c) => c.provider);
+			const ordered = getScheduledMemberOrder(pool, available, new Date());
+			if (ordered.length === 0) return;
+
+			// Rebuild pool candidates in schedule order, keep chain candidates at the end.
+			const chainCandidates = plan.candidates.filter(
+				(c) => c.source === "chain" || c.poolName !== pool.name,
+			);
+			const reordered = ordered
+				.map((provider) => poolCandidates.find((c) => c.provider === provider))
+				.filter((c): c is FailoverCandidate => Boolean(c));
+			plan.candidates = [...reordered, ...chainCandidates];
+
+			const first = ordered[0];
+			if (first) {
+				ctx.ui.notify(
+					`[pool:${pool.name}] scheduled: ${first} selected by schedule priority`,
+					"info",
+				);
+			}
+			return;
+		}
+
+		if (strategy === "custom") {
+			const available = poolCandidates.map((c) => c.provider);
+			try {
+				const best = await runCustomSelector(
+					pool,
+					available,
+					currentModel.provider,
+					currentModel.id,
+					lastUserPrompt || undefined,
+				);
+				if (best) {
+					const bestIdx = plan.candidates.findIndex(
+						(c) => c.provider === best && c.source === "pool",
+					);
+					if (bestIdx > 0) {
+						const [moved] = plan.candidates.splice(bestIdx, 1);
+						plan.candidates.unshift(moved);
+						ctx.ui.notify(
+							`[pool:${pool.name}] custom: selector chose ${best}`,
+							"info",
+						);
+					}
+				}
+			} catch {
+				// Custom selector failed -- proceed with default order.
+			}
+			return;
+		}
+	}
+
 	private ensureCascadeState(prompt: string | null, currentModel: Model<Api>): FailoverCascadeState {
 		if (!prompt) {
 			const fallbackState: FailoverCascadeState = {
@@ -2283,38 +2665,15 @@ class PoolManager {
 			},
 		);
 
-		// When the pool uses "quota-first" strategy, reorder same-pool
-		// candidates by remaining quota so the healthiest member goes first.
-		if (pool.strategy === "quota-first" && plan.candidates.length > 1) {
-			const poolCandidates = plan.candidates.filter(
-				(c) => c.source === "pool" && c.poolName === pool.name,
-			);
-			if (poolCandidates.length > 1) {
-				try {
-					const best = await this.getQuotaBestMember(
-						pool,
-						currentModel.provider,
-						ctx.modelRegistry.authStorage,
-						cascade.attemptedProviders,
-					);
-					if (best) {
-						const bestIdx = plan.candidates.findIndex(
-							(c) => c.provider === best && c.source === "pool",
-						);
-						if (bestIdx > 0) {
-							const [moved] = plan.candidates.splice(bestIdx, 1);
-							plan.candidates.unshift(moved);
-							ctx.ui.notify(
-								`[pool:${pool.name}] quota-first: ${best} has the most remaining quota`,
-								"info",
-							);
-						}
-					}
-				} catch {
-					// Quota check failed -- proceed with default order.
-				}
-			}
-		}
+		// Strategy-aware reordering of pool candidates before failover.
+		await this.reorderCandidatesByStrategy(
+			pool,
+			plan,
+			currentModel,
+			ctx,
+			cascade,
+			lastUserPrompt,
+		);
 
 		const continuation = formatFailoverContinuation(plan.candidates[0]);
 		for (const skip of plan.skips) {
@@ -2954,12 +3313,66 @@ function createPoolValidationMessage(members: string[]): string | null {
 	return null;
 }
 
+/** Parse a human-friendly schedule window like "9-17 mon-fri" or "22-6". */
+function parseScheduleWindowInput(raw: string): ScheduleWindow | null {
+	const window: ScheduleWindow = {};
+	const parts = raw.trim().split(/\s+/);
+
+	for (const part of parts) {
+		// Hour range: "9-17" or "22-6"
+		const hourMatch = part.match(/^(\d{1,2})-(\d{1,2})$/);
+		if (hourMatch) {
+			const start = parseInt(hourMatch[1], 10);
+			const end = parseInt(hourMatch[2], 10);
+			if (start >= 0 && start <= 23 && end >= 0 && end <= 23) {
+				window.hours = [start, end];
+				continue;
+			}
+		}
+		// Day range: "mon-fri" or single day: "mon"
+		const dayRangeMatch = part.match(/^([a-z]{3})-([a-z]{3})$/);
+		if (dayRangeMatch) {
+			const startDay = dayRangeMatch[1] as DayOfWeek;
+			const endDay = dayRangeMatch[2] as DayOfWeek;
+			const startIdx = ALL_DAYS.indexOf(startDay);
+			const endIdx = ALL_DAYS.indexOf(endDay);
+			if (startIdx >= 0 && endIdx >= 0) {
+				const days: DayOfWeek[] = [];
+				for (let i = startIdx; i !== (endIdx + 1) % 7; i = (i + 1) % 7) {
+					days.push(ALL_DAYS[i]);
+				}
+				days.push(ALL_DAYS[endIdx]);
+				window.days = [...new Set(days)];
+				continue;
+			}
+		}
+		// Single day
+		if (ALL_DAYS.includes(part as DayOfWeek)) {
+			window.days = window.days || [];
+			if (!window.days.includes(part as DayOfWeek)) {
+				window.days.push(part as DayOfWeek);
+			}
+			continue;
+		}
+		// Date range: "2025-01-01..2025-01-31"
+		const dateMatch = part.match(/^(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})$/);
+		if (dateMatch) {
+			window.dateRange = { from: dateMatch[1], to: dateMatch[2] };
+		}
+	}
+
+	if (!window.hours && !window.days && !window.dateRange) return null;
+	return window;
+}
+
 function buildPoolConfig(input: {
 	name: string;
 	baseProvider: string;
 	members: string[];
 	enabled?: boolean;
 	strategy?: PoolStrategy;
+	memberSchedule?: Record<string, MemberSchedule>;
+	selectorScript?: string;
 }): { ok: true; pool: PoolConfig } | { ok: false; error: string } {
 	const name = input.name.trim();
 	if (!name) {
@@ -2977,6 +3390,12 @@ function buildPoolConfig(input: {
 	};
 	if (input.strategy && input.strategy !== "round-robin") {
 		pool.strategy = input.strategy;
+	}
+	if (input.memberSchedule && Object.keys(input.memberSchedule).length > 0) {
+		pool.memberSchedule = input.memberSchedule;
+	}
+	if (input.selectorScript) {
+		pool.selectorScript = input.selectorScript;
 	}
 	return { ok: true, pool };
 }
@@ -3238,11 +3657,82 @@ async function promptForPoolDefinition(
 	const strategyItems = [
 		"round-robin -- Rotate members sequentially (default)",
 		"quota-first -- Prefer the member with the most remaining quota",
+		"scheduled -- Use per-member time windows and priority roles",
+		"custom -- Delegate to a JS selector script",
 	];
 	const strategyPick = await ctx.ui.select("Selection strategy", strategyItems);
-	const strategy: PoolStrategy = strategyPick?.startsWith("quota-first") ? "quota-first" : "round-robin";
+	let strategy: PoolStrategy = "round-robin";
+	if (strategyPick?.startsWith("quota-first")) strategy = "quota-first";
+	else if (strategyPick?.startsWith("scheduled")) strategy = "scheduled";
+	else if (strategyPick?.startsWith("custom")) strategy = "custom";
 
-	const built = buildPoolConfig({ name: poolName, baseProvider, members, enabled: true, strategy });
+	// Collect strategy-specific config
+	let memberSchedule: Record<string, MemberSchedule> | undefined;
+	let selectorScript: string | undefined;
+
+	if (strategy === "scheduled" && members.length > 0) {
+		memberSchedule = {};
+		for (const member of members) {
+			const roleItems = [
+				"default -- Always available (no schedule needed)",
+				"preferred -- Only during time windows (burn quota when window active)",
+				"overflow -- Last resort (used when preferred/default exhausted)",
+			];
+			const rolePick = await ctx.ui.select(`Role for ${member}`, roleItems);
+			if (!rolePick) continue;
+
+			let role: "preferred" | "overflow" | undefined;
+			if (rolePick.startsWith("preferred")) role = "preferred";
+			else if (rolePick.startsWith("overflow")) role = "overflow";
+
+			if (role === "preferred") {
+				const windowDef = await ctx.ui.input(
+					`Time window for ${member}`,
+					"hours e.g. 9-17, days e.g. mon-fri (or leave empty for always)",
+				);
+				const schedule: MemberSchedule = { role, windows: [] };
+				if (windowDef?.trim()) {
+					const window = parseScheduleWindowInput(windowDef.trim());
+					if (window) schedule.windows = [window];
+				}
+				memberSchedule[member] = schedule;
+			} else if (role === "overflow") {
+				memberSchedule[member] = { role };
+			}
+			// "default" role = no entry needed
+		}
+		if (Object.keys(memberSchedule).length === 0) memberSchedule = undefined;
+	}
+
+	if (strategy === "custom") {
+		const scriptPath = await ctx.ui.input(
+			"Selector script path",
+			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+		);
+		if (scriptPath?.trim()) {
+			selectorScript = scriptPath.trim();
+			const resolved = resolveSelectorScriptPath(selectorScript);
+			if (!existsSync(resolved)) {
+				ctx.ui.notify(
+					`Warning: script not found at ${resolved}. You can create it later.`,
+					"warning",
+				);
+			}
+		} else {
+			ctx.ui.notify("No selector script provided. Pool will fall back to round-robin.", "warning");
+			strategy = "round-robin";
+		}
+	}
+
+	const built = buildPoolConfig({
+		name: poolName,
+		baseProvider,
+		members,
+		enabled: true,
+		strategy,
+		memberSchedule,
+		selectorScript,
+	});
 	if (!built.ok) {
 		ctx.ui.notify(built.error, "warning");
 		return undefined;
@@ -3400,6 +3890,16 @@ async function changePoolStrategy(
 			label: "quota-first",
 			description: "Prefer the member with the most remaining quota",
 		},
+		{
+			value: "scheduled",
+			label: "scheduled",
+			description: "Use per-member time windows and priority roles",
+		},
+		{
+			value: "custom",
+			label: "custom",
+			description: "Delegate to a JS selector script",
+		},
 	];
 
 	const selected = await showWrappedSelect(ctx, {
@@ -3420,9 +3920,63 @@ async function changePoolStrategy(
 
 	if (nextStrategy === "round-robin") {
 		delete pool.strategy;
+		delete pool.memberSchedule;
+		delete pool.selectorScript;
 	} else {
 		pool.strategy = nextStrategy;
 	}
+
+	// Collect strategy-specific config
+	if (nextStrategy === "scheduled") {
+		const memberSchedule: Record<string, MemberSchedule> = {};
+		for (const member of pool.members) {
+			const roleItems = [
+				"default -- Always available (no schedule needed)",
+				"preferred -- Only during time windows",
+				"overflow -- Last resort",
+			];
+			const rolePick = await ctx.ui.select(`Role for ${member}`, roleItems);
+			if (!rolePick) continue;
+
+			let role: "preferred" | "overflow" | undefined;
+			if (rolePick.startsWith("preferred")) role = "preferred";
+			else if (rolePick.startsWith("overflow")) role = "overflow";
+
+			if (role === "preferred") {
+				const windowDef = await ctx.ui.input(
+					`Time window for ${member}`,
+					"e.g. 9-17 mon-fri",
+				);
+				const schedule: MemberSchedule = { role, windows: [] };
+				if (windowDef?.trim()) {
+					const window = parseScheduleWindowInput(windowDef.trim());
+					if (window) schedule.windows = [window];
+				}
+				memberSchedule[member] = schedule;
+			} else if (role === "overflow") {
+				memberSchedule[member] = { role };
+			}
+		}
+		pool.memberSchedule = Object.keys(memberSchedule).length > 0 ? memberSchedule : undefined;
+		delete pool.selectorScript;
+	} else if (nextStrategy === "custom") {
+		const scriptPath = await ctx.ui.input(
+			"Selector script path",
+			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+		);
+		if (!scriptPath?.trim()) {
+			ctx.ui.notify("No script path provided. Reverting to round-robin.", "warning");
+			delete pool.strategy;
+			return;
+		}
+		pool.selectorScript = scriptPath.trim();
+		selectorCache.delete(resolveSelectorScriptPath(pool.selectorScript));
+		delete pool.memberSchedule;
+	} else if (nextStrategy === "quota-first") {
+		delete pool.memberSchedule;
+		delete pool.selectorScript;
+	}
+
 	saveGlobalConfig(config);
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Pool "${pool.name}" strategy changed to ${nextStrategy}.`, "info");
@@ -3677,10 +4231,14 @@ function formatPoolStatusLines(
 		`members: ${summary.memberCount}`,
 		`availability: ${summary.statusLabel}`,
 	];
+	if (pool.selectorScript) {
+		lines.push(`selector: ${pool.selectorScript}`);
+	}
 	if (pool.members.length === 0) {
 		lines.push("  [no members configured]");
 		return lines;
 	}
+	const memberSchedule = pool.memberSchedule || {};
 	for (const member of pool.members) {
 		const authed = authStorage.hasAuth(member);
 		const exhausted = pool.enabled && authed && poolManager.isMemberExhausted(pool, member);
@@ -3688,6 +4246,18 @@ function formatPoolStatusLines(
 		if (exhausted) status += " (rate limited, cooling down)";
 		if (pool.enabled && authed && !exhausted) status += " (available)";
 		if (!pool.enabled && authed) status += " (pool disabled)";
+
+		const schedule = memberSchedule[member];
+		if (schedule) {
+			const role = schedule.role || "default";
+			status += ` [${role}]`;
+			if (schedule.windows && schedule.windows.length > 0) {
+				const now = new Date();
+				const state = getScheduledMemberState(member, schedule, now);
+				status += state.active ? " (in window)" : " (outside window)";
+			}
+		}
+
 		lines.push(`  ${member} -- ${status}`);
 	}
 	return lines;
@@ -4527,6 +5097,267 @@ async function handleSubsMenu(
 }
 
 // ==========================================================================
+// /preset command handlers
+// ==========================================================================
+
+async function handlePresetCreate(
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const presetName = await ctx.ui.input("Preset name", "e.g. coding-premium, coding-budget, fastest");
+	if (!presetName?.trim()) return;
+
+	const config = loadGlobalConfig();
+	if (config.presets.find((p) => p.name === presetName.trim())) {
+		const overwrite = await ctx.ui.confirm("Preset exists", `Overwrite "${presetName.trim()}"?`);
+		if (!overwrite) return;
+	}
+
+	const envEntries = parseEnvConfig();
+	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
+	const allProviders: string[] = [];
+	for (const provider of SUPPORTED_PROVIDERS) {
+		allProviders.push(provider);
+	}
+	for (const entry of allSubs) {
+		allProviders.push(subProviderName(entry));
+	}
+
+	const entries: PresetEntry[] = [];
+	let adding = true;
+	while (adding) {
+		const providerOptions = [
+			`--- Entries (${entries.length}): ${entries.map((e) => `${e.provider}/${e.model}`).join(", ") || "none"} ---`,
+			...allProviders.map((p) => {
+				const template = PROVIDER_TEMPLATES[p];
+				const display = template?.displayName || p;
+				const sub = allSubs.find((s) => subProviderName(s) === p);
+				const label = sub ? subDisplayName(sub) : display;
+				return `${p} -- ${label}`;
+			}),
+			"[Done - save preset]",
+		];
+
+		const picked = await ctx.ui.select("Add entry (Esc cancels)", providerOptions);
+		if (!picked) return;
+		if (picked.startsWith("---")) continue;
+		if (picked === "[Done - save preset]") {
+			if (entries.length === 0) {
+				ctx.ui.notify("Add at least one entry.", "warning");
+				continue;
+			}
+			adding = false;
+			continue;
+		}
+
+		const provider = picked.split(" -- ")[0].trim();
+		const base = getBaseProvider(provider);
+		if (!base) continue;
+
+		const models = (getModels(base as any) as Model<Api>[]).map((m) => m.id);
+		if (models.length === 0) {
+			ctx.ui.notify(`No models available for ${provider}.`, "warning");
+			continue;
+		}
+
+		const model = await ctx.ui.select(`Model for ${provider}`, models);
+		if (!model) continue;
+
+		entries.push({ provider, model, enabled: true });
+	}
+
+	const preset: PresetConfig = {
+		name: presetName.trim(),
+		entries,
+		enabled: true,
+	};
+	const existingIdx = config.presets.findIndex((p) => p.name === preset.name);
+	if (existingIdx >= 0) {
+		config.presets[existingIdx] = preset;
+	} else {
+		config.presets.push(preset);
+	}
+	saveGlobalConfig(config);
+	ctx.ui.notify(
+		`Preset "${preset.name}" saved with ${entries.length} ${entries.length === 1 ? "entry" : "entries"}: ${entries.map((e) => `${e.provider}/${e.model}`).join(", ")}`,
+		"info",
+	);
+}
+
+async function handlePresetList(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.presets.length === 0) {
+		ctx.ui.notify("No presets configured. Use /preset create to add one.", "info");
+		return;
+	}
+
+	const items: SelectItem[] = config.presets.map((preset) => ({
+		value: preset.name,
+		label: `${preset.enabled ? "+" : "-"} ${preset.name}`,
+		description: preset.entries.map((e) => `${e.provider}/${e.model}`).join(" -> "),
+	}));
+
+	await showWrappedSelect(ctx, {
+		title: "Model Presets",
+		subtitle: "Presets are named routing shortcuts across providers.",
+		items,
+		confirmHint: "back",
+		cancelHint: "close",
+	});
+}
+
+async function handlePresetActivate(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	requestedName?: string,
+): Promise<void> {
+	const config = loadGlobalConfig();
+	const enabled = config.presets.filter((p) => p.enabled);
+	if (enabled.length === 0) {
+		ctx.ui.notify("No enabled presets. Use /preset create to add one.", "info");
+		return;
+	}
+
+	let presetName = requestedName?.trim();
+	if (!presetName) {
+		presetName = await showWrappedSelect(ctx, {
+			title: "Activate Preset",
+			subtitle: "Select a preset to switch to its best available entry.",
+			items: enabled.map((p) => ({
+				value: p.name,
+				label: p.name,
+				description: p.entries.filter((e) => e.enabled).map((e) => `${e.provider}/${e.model}`).join(" -> "),
+			})),
+			confirmHint: "activate",
+			cancelHint: "back",
+		});
+	}
+	if (!presetName) return;
+
+	const preset = enabled.find((p) => p.name === presetName);
+	if (!preset) {
+		ctx.ui.notify(`Preset "${presetName}" not found.`, "error");
+		return;
+	}
+
+	for (const entry of preset.entries) {
+		if (!entry.enabled) continue;
+		if (!ctx.modelRegistry.authStorage.hasAuth(entry.provider)) continue;
+		const model = ctx.modelRegistry.find(entry.provider, entry.model);
+		if (!model) continue;
+
+		const success = await pi.setModel(model);
+		if (!success) continue;
+
+		ctx.ui.notify(`Preset "${preset.name}": switched to ${entry.provider}/${entry.model}`, "info");
+		ctx.ui.setStatus("multi-pass", `preset:${preset.name} | ${entry.provider}/${entry.model}`);
+		return;
+	}
+
+	ctx.ui.notify(
+		`Preset "${preset.name}": no entry has a logged-in provider with the required model available.`,
+		"warning",
+	);
+}
+
+async function handlePresetRemove(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.presets.length === 0) {
+		ctx.ui.notify("No presets to remove.", "info");
+		return;
+	}
+
+	const selected = await showWrappedSelect(ctx, {
+		title: "Remove Preset",
+		items: config.presets.map((p) => ({
+			value: p.name,
+			label: p.name,
+			description: `${p.entries.length} entries`,
+		})),
+		confirmHint: "remove",
+		cancelHint: "back",
+	});
+	if (!selected) return;
+
+	const confirmed = await ctx.ui.confirm("Confirm", `Remove preset "${selected}"?`);
+	if (!confirmed) return;
+
+	config.presets = config.presets.filter((p) => p.name !== selected);
+	saveGlobalConfig(config);
+	ctx.ui.notify(`Removed preset "${selected}".`, "info");
+}
+
+async function handlePresetToggle(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	if (config.presets.length === 0) {
+		ctx.ui.notify("No presets configured.", "info");
+		return;
+	}
+
+	const selected = await showWrappedSelect(ctx, {
+		title: "Toggle Preset",
+		items: config.presets.map((p) => ({
+			value: p.name,
+			label: `${p.enabled ? "+" : "-"} ${p.name}`,
+			description: p.enabled ? "enabled" : "disabled",
+		})),
+		confirmHint: "toggle",
+		cancelHint: "back",
+	});
+	if (!selected) return;
+
+	const preset = config.presets.find((p) => p.name === selected);
+	if (!preset) return;
+
+	preset.enabled = !preset.enabled;
+	saveGlobalConfig(config);
+	ctx.ui.notify(`Preset "${preset.name}" is now ${preset.enabled ? "enabled" : "disabled"}.`, "info");
+}
+
+async function handlePresetMenu(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const actions: SelectItem[] = [
+		{ value: "activate", label: "activate", description: "Switch to a preset's best available entry" },
+		{ value: "create", label: "create", description: "Create a new preset" },
+		{ value: "list", label: "list", description: "Show all presets" },
+		{ value: "toggle", label: "toggle", description: "Enable/disable a preset" },
+		{ value: "remove", label: "remove", description: "Delete a preset" },
+	];
+
+	let preferredAction = "activate";
+	while (true) {
+		const action = await showWrappedSelect(ctx, {
+			title: "Model Presets",
+			items: actions,
+			initialValue: preferredAction,
+			confirmHint: "open",
+			cancelHint: "close",
+		});
+		if (!action) return;
+
+		preferredAction = action;
+		switch (action) {
+			case "activate":
+				await handlePresetActivate(pi, ctx);
+				break;
+			case "create":
+				await handlePresetCreate(ctx);
+				break;
+			case "list":
+				await handlePresetList(ctx);
+				break;
+			case "toggle":
+				await handlePresetToggle(ctx);
+				break;
+			case "remove":
+				await handlePresetRemove(ctx);
+				break;
+		}
+	}
+}
+
+// ==========================================================================
 // Extension entry point
 // ==========================================================================
 
@@ -4658,6 +5489,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				subscriptions: effective.subscriptions,
 				pools: effective.pools,
 				chains: effective.chains,
+				presets: effective.presets,
 			}),
 		);
 
@@ -4785,6 +5617,58 @@ export default function multiSub(pi: ExtensionAPI) {
 					return handlePoolProject(ctx, poolManager);
 				default:
 					return handlePoolMenu(ctx, poolManager);
+			}
+		},
+	});
+
+	// Register /preset command
+	pi.registerCommand("preset", {
+		description: "Manage model presets (named routing shortcuts across providers)",
+		getArgumentCompletions: (prefix: string) => {
+			const subcommands = ["activate", "create", "list", "toggle", "remove"];
+			const filtered = subcommands.filter((s) => s.startsWith(prefix));
+			if (filtered.length > 0) {
+				return filtered.map((s) => ({ value: s, label: s }));
+			}
+			// Also complete preset names for quick activation
+			const config = loadGlobalConfig();
+			const presetNames = config.presets
+				.filter((p) => p.enabled && p.name.startsWith(prefix))
+				.map((p) => ({ value: p.name, label: p.name }));
+			return presetNames.length > 0 ? presetNames : null;
+		},
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			const subcommand = (parts[0] || "").toLowerCase();
+			const rest = parts.slice(1).join(" ");
+			switch (subcommand) {
+				case "activate":
+				case "use":
+					return handlePresetActivate(pi, ctx, rest || undefined);
+				case "create":
+				case "new":
+					return handlePresetCreate(ctx);
+				case "list":
+				case "ls":
+					return handlePresetList(ctx);
+				case "toggle":
+					return handlePresetToggle(ctx);
+				case "remove":
+				case "rm":
+				case "delete":
+					return handlePresetRemove(ctx);
+				default:
+					// If the argument matches a preset name, activate it directly
+					if (subcommand) {
+						const config = loadGlobalConfig();
+						const preset = config.presets.find(
+							(p) => p.name.toLowerCase() === subcommand && p.enabled,
+						);
+						if (preset) {
+							return handlePresetActivate(pi, ctx, preset.name);
+						}
+					}
+					return handlePresetMenu(pi, ctx);
 			}
 		},
 	});
