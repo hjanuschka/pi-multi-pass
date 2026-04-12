@@ -89,7 +89,7 @@ interface ProviderTemplate {
 	displayName: string;
 	builtinOAuth: OAuthProviderInterface;
 	usesCallbackServer?: boolean;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
+	buildOAuth(entry: SubEntry): Omit<OAuthProviderInterface, "id">;
 	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
 }
 
@@ -97,9 +97,9 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
 		builtinOAuth: anthropicOAuthProvider,
-		buildOAuth(index: number) {
+		buildOAuth(entry: SubEntry) {
 			return {
-				name: `Anthropic #${index}`,
+				name: formatLoginProviderName("Anthropic", entry),
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 					return loginAnthropic({
 						onAuth: callbacks.onAuth,
@@ -122,9 +122,9 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		displayName: "ChatGPT Plus/Pro (Codex)",
 		builtinOAuth: openaiCodexOAuthProvider,
 		usesCallbackServer: true,
-		buildOAuth(index: number) {
+		buildOAuth(entry: SubEntry) {
 			return {
-				name: `ChatGPT Codex #${index}`,
+				name: formatLoginProviderName("ChatGPT Codex", entry),
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 					return loginOpenAICodex({
@@ -147,9 +147,9 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	"github-copilot": {
 		displayName: "GitHub Copilot",
 		builtinOAuth: githubCopilotOAuthProvider,
-		buildOAuth(index: number) {
+		buildOAuth(entry: SubEntry) {
 			return {
-				name: `GitHub Copilot #${index}`,
+				name: formatLoginProviderName("GitHub Copilot", entry),
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 					return loginGitHubCopilot({
 						onAuth: (url: string, instructions?: string) =>
@@ -186,9 +186,9 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		displayName: "Google Cloud Code Assist",
 		builtinOAuth: geminiCliOAuthProvider,
 		usesCallbackServer: true,
-		buildOAuth(index: number) {
+		buildOAuth(entry: SubEntry) {
 			return {
-				name: `Google Cloud Code Assist #${index}`,
+				name: formatLoginProviderName("Google Cloud Code Assist", entry),
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 					return loginGeminiCli(
@@ -214,9 +214,9 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		displayName: "Antigravity",
 		builtinOAuth: antigravityOAuthProvider,
 		usesCallbackServer: true,
-		buildOAuth(index: number) {
+		buildOAuth(entry: SubEntry) {
 			return {
-				name: `Antigravity #${index}`,
+				name: formatLoginProviderName("Antigravity", entry),
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 					return loginAntigravity(
@@ -1420,6 +1420,11 @@ interface SubEntry {
 	label?: string;
 }
 
+function formatLoginProviderName(baseName: string, entry: SubEntry): string {
+	if (!entry.label) return `${baseName} #${entry.index}`;
+	return `${entry.label} — ${baseName}`;
+}
+
 /** Pool member selection strategy.
  *  - "round-robin": rotate sequentially through members (default).
  *  - "quota-first": query built-in quota checkers and prefer the member
@@ -1899,7 +1904,7 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	if (!template) return;
 
 	const name = subProviderName(entry);
-	const oauth = template.buildOAuth(entry.index);
+	const oauth = template.buildOAuth(entry);
 	const modifyModels = template.buildModifyModels?.(name);
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
@@ -2894,6 +2899,7 @@ async function handleSubsSwitch(
 }
 
 async function renameSubscriptionLabel(
+	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	config: MultiPassConfig,
 	entry: SubEntry,
@@ -2907,6 +2913,8 @@ async function renameSubscriptionLabel(
 
 	entry.label = nextLabel.trim() || undefined;
 	saveGlobalConfig(config);
+	registerSub(pi, entry);
+	ctx.modelRegistry.refresh();
 
 	const nextName = subDisplayName(entry);
 	if (nextName === previousName) {
@@ -3001,13 +3009,11 @@ async function showSubscriptionActions(
 	if (!action) return;
 
 	if (action === "rename") {
-		return renameSubscriptionLabel(ctx, config, entry);
+		return renameSubscriptionLabel(pi, ctx, config, entry);
 	}
 	if (action === "login") {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		ctx.ui.notify(`Starting login for ${subDisplayName(entry)}...`, "info");
+		pi.sendUserMessage(`/login ${name}`);
 		return;
 	}
 	if (action === "logout") {
@@ -3108,12 +3114,10 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	);
 
 	if (loginNow) {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		ctx.ui.notify(`Starting login for ${subDisplayName(entry)}...`, "info");
+		pi.sendUserMessage(`/login ${subProviderName(entry)}`);
 	} else {
-		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
+		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /login to authenticate later.`, "info");
 	}
 }
 
@@ -3152,7 +3156,7 @@ async function handleSubsRemove(
 	return removeSubscriptionEntry(pi, ctx, config, entry, poolManager);
 }
 
-async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsLogin(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
@@ -3173,7 +3177,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 
 	const selectedProviderName = await showWrappedSelect(ctx, {
 		title: "Login to subscription",
-		subtitle: "Select a subscription to see login instructions.",
+		subtitle: "Select a subscription to start its login flow.",
 		initialValue: ctx.model?.provider,
 		items: notLoggedIn.map((entry) => ({
 			value: subProviderName(entry),
@@ -3188,10 +3192,8 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.ui.notify(
-		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-		"info",
-	);
+	ctx.ui.notify(`Starting login for ${subDisplayName(entry)}...`, "info");
+	pi.sendUserMessage(`/login ${selectedProviderName}`);
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
@@ -5078,7 +5080,7 @@ async function handleSubsMenu(
 				await handleSubsRemove(pi, ctx, poolManager);
 				break;
 			case "login":
-				await handleSubsLogin(ctx);
+				await handleSubsLogin(pi, ctx);
 				break;
 			case "logout":
 				await handleSubsLogout(ctx);
@@ -5559,7 +5561,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "delete":
 					return handleSubsRemove(pi, ctx, poolManager);
 				case "login":
-					return handleSubsLogin(ctx);
+					return handleSubsLogin(pi, ctx);
 				case "logout":
 					return handleSubsLogout(ctx);
 				case "switch":

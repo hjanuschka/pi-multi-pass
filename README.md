@@ -30,8 +30,8 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 ## Quick start
 
 ```
-/subs add              Pick a provider, add a subscription
-/login                 Authenticate the new subscription
+/subs add              Pick a provider, add a subscription, optionally start login immediately
+/login                 Authenticate any subscription directly
 /subs switch           Manually switch to another subscription/provider
 /subs limits           Check built-in quota support (Codex + Google)
 /pool create           Group subs into a rotation pool (with strategy selection)
@@ -50,7 +50,7 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs              Open menu
 /subs add          Add a new subscription
 /subs remove       Remove a subscription
-/subs login        Login to a subscription
+/subs login        Start login for a subscription
 /subs logout       Logout from a subscription
 /subs switch       Manually switch to a subscription/provider now
 /subs list         List subscriptions with auth status; select one for quick actions
