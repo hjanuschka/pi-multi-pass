@@ -1,17 +1,24 @@
-# pi-multi-pass
+# oh-my-pi-multi-pass
 
-Multi-subscription extension for [pi](https://github.com/badlogic/pi-mono) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+Multi-subscription extension for [oh-my-pi](https://github.com/can1357/oh-my-pi) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+
+Port of [pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass) by @hjanuschka, retargeted to the `@oh-my-pi/*` packages.
 
 ## Install
 
+Drop the extension file into your user extensions directory:
+
 ```bash
-pi install npm:pi-multi-pass
+ln -s "$(pwd)/extensions/multi-sub.ts" ~/.omp/agent/extensions/multi-pass.ts
 ```
 
-Or via git:
+(Or copy instead of symlink.) Restart your oh-my-pi session and `/subs help`, `/pool help`, `/mp-preset help` should be available.
 
-```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
+Alternatively, register the package directory in your config (`~/.omp/agent/config.yml`):
+
+```yaml
+extensions:
+  - /path/to/oh-my-pi-multi-pass
 ```
 
 ## Features
@@ -96,7 +103,7 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 
 ## Project-level configuration
 
-Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
+Use `/pool project` to configure per-project subscription affinity. This creates `.omp/multi-pass.json` in your project directory.
 
 When `allowedSubs` is set, multi-pass now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names.
 
@@ -113,7 +120,7 @@ cd ~/work/corp-project
 
 # Side project: allow everything (no restriction)
 cd ~/side-project
-# No .pi/multi-pass.json needed -- uses all global subs
+# No .omp/multi-pass.json needed -- uses all global subs
 ```
 
 ### What project config can do
@@ -128,7 +135,7 @@ cd ~/side-project
 
 ### Project config file
 
-`.pi/multi-pass.json`:
+`.omp/multi-pass.json`:
 
 ```json
 {
@@ -249,12 +256,12 @@ Point to a JS script that decides which member to try first. The script receives
 }
 ```
 
-Script paths are resolved relative to `~/.pi/agent/`. Absolute paths and `~/` paths also work.
+Script paths are resolved relative to `~/.omp/agent/`. Absolute paths and `~/` paths also work.
 
 **Selector script interface:**
 
 ```js
-// ~/.pi/agent/selectors/my-codex-selector.js
+// ~/.omp/agent/selectors/my-codex-selector.js
 module.exports = async function select(ctx) {
   // ctx.members:         string[]  -- available (non-exhausted, authenticated) members
   // ctx.currentProvider: string    -- the provider that just hit a rate limit
@@ -317,7 +324,7 @@ Presets are named routing shortcuts that map to an ordered list of provider+mode
 
 ### Config
 
-Presets are stored in `~/.pi/agent/multi-pass.json`:
+Presets are stored in `~/.omp/agent/multi-pass.json`:
 
 ```json
 {
@@ -371,7 +378,7 @@ Google quota is not a single flat subscription bucket, so the details view shows
 
 When a pool uses the `quota-first` strategy, the same quota checkers are used automatically during failover to pick the healthiest member instead of just round-robin.
 
-When a project defines `.pi/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
+When a project defines `.omp/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
 
 Future providers can add another checker without changing the `/subs` command surface.
 
@@ -387,8 +394,8 @@ Env entries merge with saved config.
 
 | File | Scope | Contains |
 |---|---|---|
-| `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
-| `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
+| `~/.omp/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
+| `.omp/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
 
 ## License
 

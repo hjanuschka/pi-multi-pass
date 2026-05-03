@@ -1,5 +1,5 @@
 /**
- * Multi-Subscription extension for pi.
+ * Multi-Subscription extension for oh-my-pi.
  *
  * Register additional OAuth subscription accounts for any supported provider.
  * Each extra account gets its own provider name, /login entry, and cloned models.
@@ -7,7 +7,7 @@
  * Features:
  *   - /subs: manage subscriptions (add, remove, login, logout, status)
  *   - /pool: define provider pools with auto-rotation on rate limit errors
- *   - Project-level pool config: .pi/multi-pass.json overrides global pools
+ *   - Project-level pool config: .omp/multi-pass.json overrides global pools
  *   - MULTI_SUB env var for scripting
  *
  * Pool auto-rotation: group subscriptions into pools. When the active sub
@@ -16,8 +16,8 @@
  * provider/account.
  *
  * Config files:
- *   Global:  ~/.pi/agent/multi-pass.json  (subscriptions + default pools)
- *   Project: .pi/multi-pass.json          (pool overrides + subscription filtering)
+ *   Global:  ~/.omp/agent/multi-pass.json  (subscriptions + default pools)
+ *   Project: .omp/multi-pass.json          (pool overrides + subscription filtering)
  *
  * Project-level config can:
  *   - Define project-specific pools (override global pools)
@@ -39,44 +39,36 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
-} from "@mariozechner/pi-coding-agent";
+} from "@oh-my-pi/pi-coding-agent";
 import {
 	BorderedLoader,
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
-} from "@mariozechner/pi-coding-agent";
+} from "@oh-my-pi/pi-coding-agent";
+import { loginAnthropic, refreshAnthropicToken } from "@oh-my-pi/pi-ai/utils/oauth/anthropic";
+import { loginOpenAICodex, refreshOpenAICodexToken } from "@oh-my-pi/pi-ai/utils/oauth/openai-codex";
 import {
-	anthropicOAuthProvider,
-	loginAnthropic,
-	refreshAnthropicToken,
-	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	githubCopilotOAuthProvider,
 	loginGitHubCopilot,
 	refreshGitHubCopilotToken,
 	getGitHubCopilotBaseUrl,
 	normalizeDomain,
-	geminiCliOAuthProvider,
-	loginGeminiCli,
-	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
-	type OAuthCredentials,
-	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
-} from "@mariozechner/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
+} from "@oh-my-pi/pi-ai/utils/oauth/github-copilot";
+import { loginGeminiCli, refreshGoogleCloudToken } from "@oh-my-pi/pi-ai/utils/oauth/google-gemini-cli";
+import { loginAntigravity, refreshAntigravityToken } from "@oh-my-pi/pi-ai/utils/oauth/google-antigravity";
+import type {
+	OAuthCredentials,
+	OAuthLoginCallbacks,
+	OAuthProviderInterface,
+} from "@oh-my-pi/pi-ai/utils/oauth/types";
+import { getBundledModels as getModels, type Api, type Model } from "@oh-my-pi/pi-ai";
 import {
 	Container,
-	Key,
 	SelectList,
 	Text,
 	matchesKey,
 	type SelectItem,
-} from "@mariozechner/pi-tui";
+} from "@oh-my-pi/pi-tui";
 
 // ==========================================================================
 // Provider templates
@@ -87,16 +79,14 @@ type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
 	usesCallbackServer?: boolean;
 	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
-	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+	buildModifyModels?(providerName: string): (models: Model<Api>[], credentials: OAuthCredentials) => Model<Api>[];
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
 		buildOAuth(index: number) {
 			return {
 				name: `Anthropic #${index}`,
@@ -120,7 +110,6 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
@@ -146,7 +135,6 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"github-copilot": {
 		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
 		buildOAuth(index: number) {
 			return {
 				name: `GitHub Copilot #${index}`,
@@ -174,7 +162,7 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 				const domain = creds.enterpriseUrl
 					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
 					: undefined;
-				const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
+				const baseUrl = getGitHubCopilotBaseUrl(domain);
 				return models.map((m) =>
 					m.provider === providerName ? { ...m, baseUrl } : m,
 				);
@@ -184,18 +172,19 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"google-gemini-cli": {
 		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
 				name: `Google Cloud Code Assist #${index}`,
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGeminiCli(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
+					return loginGeminiCli({
+						onAuth: callbacks.onAuth,
+						onProgress: callbacks.onProgress,
+						onManualCodeInput: callbacks.onManualCodeInput,
+						onPrompt: callbacks.onPrompt,
+						signal: callbacks.signal,
+					});
 				},
 				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 					const creds = credentials as GeminiCredentials;
@@ -212,18 +201,19 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"google-antigravity": {
 		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
 				name: `Antigravity #${index}`,
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
+					return loginAntigravity({
+						onAuth: callbacks.onAuth,
+						onProgress: callbacks.onProgress,
+						onManualCodeInput: callbacks.onManualCodeInput,
+						onPrompt: callbacks.onPrompt,
+						signal: callbacks.signal,
+					});
 				},
 				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
 					const creds = credentials as GeminiCredentials;
@@ -692,7 +682,8 @@ async function showWrappedSelect(
 			description: (text) => theme.fg("muted", text),
 			scrollInfo: (text) => theme.fg("dim", text),
 			noMatch: (text) => theme.fg("warning", text),
-		});
+			symbols: (theme as unknown as { symbols?: unknown }).symbols ?? ({} as never),
+		} as ConstructorParameters<typeof SelectList>[2]);
 		selectList.setSelectedIndex(getWrappedSelectIndex(options.items, options.initialValue));
 		selectList.onSelect = (item) => done(item.value);
 		selectList.onCancel = () => done(null);
@@ -713,14 +704,14 @@ async function showWrappedSelect(
 					? options.items.findIndex((item) => item.value === current.value)
 					: 0;
 
-				if (matchesKey(data, Key.up) && options.items.length > 1 && currentIndex === 0) {
+				if (matchesKey(data, "up") && options.items.length > 1 && currentIndex === 0) {
 					selectList.setSelectedIndex(options.items.length - 1);
 					tui.requestRender();
 					return;
 				}
 
 				if (
-					matchesKey(data, Key.down)
+					matchesKey(data, "down")
 					&& options.items.length > 1
 					&& currentIndex === options.items.length - 1
 				) {
@@ -960,17 +951,20 @@ async function resolveGoogleQuotaAccess(
 	auth: AuthStorageEntry,
 ): Promise<{ accessToken: string; projectId?: string }> {
 	const projectId = getGoogleProjectId(account, auth);
-	const hasFreshAccess = typeof auth.access === "string"
-		&& auth.access.length > 0
-		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
+	const access = (auth as { access?: unknown }).access;
+	const expires = (auth as { expires?: unknown }).expires;
+	const refresh = (auth as { refresh?: unknown }).refresh;
+	const hasFreshAccess = typeof access === "string"
+		&& access.length > 0
+		&& (typeof expires !== "number" || expires > Date.now() + 60_000);
 	if (hasFreshAccess) {
-		return { accessToken: auth.access, projectId };
+		return { accessToken: access as string, projectId };
 	}
 
-	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		const credentials = account.baseProvider === "google-gemini-cli"
-			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
-			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
+	if (typeof refresh === "string" && refresh.length > 0) {
+		const credentials = (account.baseProvider === "google-gemini-cli"
+			? await refreshGoogleCloudToken(refresh, projectId || "")
+			: await refreshAntigravityToken(refresh, projectId || "")) as GeminiCredentials;
 		return {
 			accessToken: credentials.access,
 			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
@@ -979,8 +973,8 @@ async function resolveGoogleQuotaAccess(
 		};
 	}
 
-	if (typeof auth.access === "string" && auth.access.length > 0) {
-		return { accessToken: auth.access, projectId };
+	if (typeof access === "string" && access.length > 0) {
+		return { accessToken: access, projectId };
 	}
 
 	throw new Error("Missing Google access token. Log in again.");
@@ -1411,7 +1405,7 @@ async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
 }
 
 // ==========================================================================
-// Config persistence (~/.pi/agent/multi-pass.json)
+// Config persistence (~/.omp/agent/multi-pass.json)
 // ==========================================================================
 
 interface SubEntry {
@@ -1517,7 +1511,7 @@ interface PoolConfig {
 	memberSchedule?: Record<string, MemberSchedule>;
 	/** Path to a JS module exporting a selector function.
 	 *  Only used when strategy is "custom". Resolved relative to the
-	 *  global config directory (~/.pi/agent/). */
+	 *  global config directory (~/.omp/agent/). */
 	selectorScript?: string;
 }
 
@@ -1546,7 +1540,7 @@ interface MultiPassConfig {
 	presets: PresetConfig[];
 }
 
-/** Project-level config (.pi/multi-pass.json) */
+/** Project-level config (.omp/multi-pass.json) */
 interface ProjectConfig {
 	/** Override pools for this project. If set, replaces global pools. */
 	pools?: PoolConfig[];
@@ -1575,7 +1569,7 @@ function globalConfigPath(): string {
 }
 
 function projectConfigPath(cwd: string): string {
-	return join(cwd, ".pi", "multi-pass.json");
+	return join(cwd, ".omp", "multi-pass.json");
 }
 
 function emptyMultiPassConfig(): MultiPassConfig {
@@ -2934,7 +2928,8 @@ async function removeSubscriptionEntry(
 	if (ctx.modelRegistry.authStorage.hasAuth(name)) {
 		ctx.modelRegistry.authStorage.logout(name);
 	}
-	pi.unregisterProvider(name);
+	const piUnregister = (pi as unknown as { unregisterProvider?: (n: string) => void }).unregisterProvider;
+	if (typeof piUnregister === "function") piUnregister.call(pi, name);
 
 	for (const pool of config.pools) {
 		pool.members = pool.members.filter((member) => member !== name);
@@ -3707,7 +3702,7 @@ async function promptForPoolDefinition(
 	if (strategy === "custom") {
 		const scriptPath = await ctx.ui.input(
 			"Selector script path",
-			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+			"e.g. selectors/my-pool.js (relative to ~/.omp/agent/)",
 		);
 		if (scriptPath?.trim()) {
 			selectorScript = scriptPath.trim();
@@ -3962,7 +3957,7 @@ async function changePoolStrategy(
 	} else if (nextStrategy === "custom") {
 		const scriptPath = await ctx.ui.input(
 			"Selector script path",
-			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+			"e.g. selectors/my-pool.js (relative to ~/.omp/agent/)",
 		);
 		if (!scriptPath?.trim()) {
 			ctx.ui.notify("No script path provided. Reverting to round-robin.", "warning");
@@ -5009,7 +5004,7 @@ async function handlePoolMenu(
 		"toggle   -- Enable/disable a pool",
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
-		"project  -- Project-level pool config (.pi/multi-pass.json)",
+		"project  -- Project-level pool config (.omp/multi-pass.json)",
 	];
 
 	const selected = await ctx.ui.select("Pool Manager", actions);
@@ -5467,16 +5462,19 @@ export default function multiSub(pi: ExtensionAPI) {
 		await enforceProjectRestriction(ctx, "session");
 	});
 
-	pi.on("model_select", async (_event, ctx) => {
-		await enforceProjectRestriction(ctx, "model");
-	});
+	(pi.on as unknown as (event: string, handler: (e: unknown, ctx: ExtensionContext) => Promise<void>) => void)(
+		"model_select",
+		async (_event, ctx) => {
+			await enforceProjectRestriction(ctx, "model");
+		},
+	);
 
 	pi.on("input", async (event, ctx) => {
 		if (event.text.trimStart().startsWith("/")) {
-			return { action: "continue" as const };
+			return {};
 		}
 		const ok = await enforceProjectRestriction(ctx, "input");
-		return ok ? { action: "continue" as const } : { action: "handled" as const };
+		return ok ? {} : { handled: true };
 	});
 
 	// Track last user prompt for retry on rotation
@@ -5608,7 +5606,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainMenu(ctx, poolManager);
 						case "list":
 						case "ls":
-							return handlePoolChainList(ctx);
+							return handlePoolChainList(ctx, poolManager);
 						case "toggle":
 							return handlePoolChainToggle(ctx);
 						case "remove":
@@ -5617,7 +5615,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainRemove(ctx);
 						case "status":
 						case "info":
-							return handlePoolChainStatus(ctx);
+							return handlePoolChainStatus(ctx, poolManager);
 						case "create":
 						case "new":
 							return handlePoolChainCreate(ctx, poolManager);
