@@ -15,7 +15,19 @@
   "author": "hjanuschka",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hjanuschka/pi-multi-pass"
+    "url": "https://github.com/rharmanca/pi-multi-pass"
+  },
+  "bugs": {
+    "url": "https://github.com/rharmanca/pi-multi-pass/issues"
+  },
+  "homepage": "https://github.com/rharmanca/pi-multi-pass#readme",
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "scripts": {
+    "test": "node tests/subs-switch-check.mjs && node tests/project-restriction-check.mjs && node tests/project-aware-limits-check.mjs && node tests/subscription-limits-check.mjs && node tests/runtime-failover-check.mjs && node tests/pool-edit-check.mjs"
   },
   "pi": {
     "extensions": [

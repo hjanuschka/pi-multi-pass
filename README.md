@@ -14,6 +14,12 @@ Or via git:
 pi install git:github.com/hjanuschka/pi-multi-pass
 ```
 
+**Fork install (recommended for hardened version):**
+
+```bash
+pi install git:github.com/rharmanca/pi-multi-pass
+```
+
 ## Features
 
 - **Multiple subscriptions**: Add extra OAuth accounts for any provider
@@ -162,8 +168,13 @@ cd ~/side-project
 1. You're using `openai-codex` and hit a rate limit
 2. Multi-pass detects the error, marks `openai-codex` as exhausted
 3. Switches to `openai-codex-2` (same model ID, different account)
-4. Retries your last prompt automatically
+4. Retries your last prompt automatically (preserving images if present)
 5. After a 5-minute cooldown, `openai-codex` becomes available again
+
+**Safeguards:**
+- If tools already executed during the failed turn, the prompt is not auto-replayed to prevent duplicate side effects.
+- Image attachments are preserved alongside text on safe retries.
+- Cascade state prevents infinite retry loops across pool members.
 
 ### Pool selection strategy
 
@@ -383,12 +394,40 @@ export MULTI_SUB="openai-codex:2,anthropic:1"
 
 Env entries merge with saved config.
 
+## Security
+
+- **Pi extensions run arbitrary code.** Only install packages from sources you trust.
+- **OAuth tokens** remain in Pi's built-in auth storage (`~/.pi/agent/auth.json`). The `multi-pass.json` config files store subscription/pool metadata only, never raw tokens.
+- **Custom selector scripts** (`selectorScript` in pool config) execute arbitrary local JavaScript. Treat any script as trusted code.
+- **Config file backups.** If a `multi-pass.json` file becomes malformed (e.g. after a failed edit), the extension backs it up with a `.invalid-<timestamp>.bak` suffix before overwriting. No token contents or raw JSON are shown in notification messages.
+- **Failover replay safety.** When a rate-limit error triggers automatic retry:
+  - Image attachments are preserved alongside the text prompt.
+  - If tools have already executed during the failed turn, the prompt is **not** automatically re-sent to avoid duplicate side effects. The provider switch still happens; you see a warning.
+
 ## Config files
 
 | File | Scope | Contains |
 |---|---|---|
 | `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
 | `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
+
+### Malformed config recovery
+
+If a `multi-pass.json` file contains invalid JSON, the extension logs a warning and treats it as if the file is empty. When you next save (via any `/subs`, `/pool`, or `/mp-preset` command), the malformed file is backed up:
+
+```
+~/.pi/agent/multi-pass.json.invalid-20250601-143015.bak
+```
+
+Then the new valid config is written. No token contents are included in the backup filename or notification.
+
+## Tests
+
+```bash
+npm test
+```
+
+Runs all test files in `tests/` using Node.js directly (no transpilation or build step required).
 
 ## License
 

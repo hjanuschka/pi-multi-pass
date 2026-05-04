@@ -32,13 +32,14 @@
  *   - google-antigravity (Antigravity)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { dirname, isAbsolute, join } from "path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
+	ImageContent,
 } from "@mariozechner/pi-coding-agent";
 import {
 	BorderedLoader,
@@ -68,6 +69,7 @@ import {
 	type OAuthLoginCallbacks,
 	type OAuthProviderInterface,
 } from "@mariozechner/pi-ai/oauth";
+import { pathToFileURL } from "url";
 import { getModels, type Api, type Model } from "@mariozechner/pi-ai";
 import {
 	Container,
@@ -1578,6 +1580,51 @@ function projectConfigPath(cwd: string): string {
 	return join(cwd, ".pi", "multi-pass.json");
 }
 
+// ==========================================================================
+// Config I/O helpers
+// ==========================================================================
+
+type ConfigReadOk<T> = { ok: true; config: T };
+type ConfigReadMissing = { ok: false; kind: "missing" };
+type ConfigReadInvalid = { ok: false; kind: "invalid"; path: string };
+type ConfigReadResult<T> = ConfigReadOk<T> | ConfigReadMissing | ConfigReadInvalid;
+
+interface SaveResult {
+	/** Path to the backup file created because the original was malformed, if any. */
+	backupPath?: string;
+}
+
+function readJsonConfig<T>(
+	path: string,
+	normalizer: (raw: unknown) => T,
+): ConfigReadResult<T> {
+	if (!existsSync(path)) return { ok: false, kind: "missing" };
+	try {
+		const raw = JSON.parse(readFileSync(path, "utf-8"));
+		return { ok: true, config: normalizer(raw) };
+	} catch {
+		return { ok: false, kind: "invalid", path };
+	}
+}
+
+/** If the file exists but is not valid JSON, back it up with a timestamp suffix. */
+function backupIfInvalid(path: string): string | undefined {
+	if (!existsSync(path)) return undefined;
+	try {
+		JSON.parse(readFileSync(path, "utf-8"));
+		return undefined; // valid JSON
+	} catch {
+		const ts = new Date().toISOString().replace(/[:.]/g, "-").replace(/\..*$/, "");
+		const backupPath = `${path}.invalid-${ts}.bak`;
+		try {
+			copyFileSync(path, backupPath);
+			return backupPath;
+		} catch {
+			return undefined;
+		}
+	}
+}
+
 function emptyMultiPassConfig(): MultiPassConfig {
 	return { subscriptions: [], pools: [], chains: [], presets: [] };
 }
@@ -1603,23 +1650,16 @@ function normalizeProjectConfig(raw: unknown): ProjectConfig {
 
 function loadGlobalConfig(): MultiPassConfig {
 	const path = globalConfigPath();
-	if (!existsSync(path)) return emptyMultiPassConfig();
-	try {
-		const raw = JSON.parse(readFileSync(path, "utf-8"));
-		return normalizeMultiPassConfig(raw);
-	} catch {
-		return emptyMultiPassConfig();
-	}
+	const result = readJsonConfig(path, normalizeMultiPassConfig);
+	if (result.ok) return result.config;
+	return emptyMultiPassConfig();
 }
 
 function loadProjectConfig(cwd: string): ProjectConfig | undefined {
 	const path = projectConfigPath(cwd);
-	if (!existsSync(path)) return undefined;
-	try {
-		return normalizeProjectConfig(JSON.parse(readFileSync(path, "utf-8")));
-	} catch {
-		return undefined;
-	}
+	const result = readJsonConfig(path, normalizeProjectConfig);
+	if (result.ok) return result.config;
+	return undefined;
 }
 
 function normalizeAllowedProviderNames(allowedSubs: string[] | undefined): string[] | undefined {
@@ -1693,18 +1733,35 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	};
 }
 
-function saveGlobalConfig(config: MultiPassConfig): void {
+function saveGlobalConfig(config: MultiPassConfig): SaveResult {
 	const path = globalConfigPath();
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	const backupPath = backupIfInvalid(path);
 	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+	return { backupPath };
 }
 
-function saveProjectConfig(cwd: string, config: ProjectConfig): void {
+function saveProjectConfig(cwd: string, config: ProjectConfig): SaveResult {
 	const path = projectConfigPath(cwd);
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	const backupPath = backupIfInvalid(path);
 	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+	return { backupPath };
+}
+
+/** Notify the user if a config save created a backup of a malformed file. */
+function notifyBackup(
+	result: SaveResult,
+	notify: (message: string, type: "info" | "warning" | "error") => void,
+): void {
+	if (result.backupPath) {
+		notify(
+			`Existing config was malformed. Backed up to: ${result.backupPath}`,
+			"warning",
+		);
+	}
 }
 
 function getProviderDisplayName(providerName: string, subscriptions: SubEntry[]): string {
@@ -1881,6 +1938,7 @@ function cloneModels(originalProvider: string, index: number) {
 		name: `${m.name} (#${index})`,
 		api: m.api,
 		reasoning: m.reasoning,
+		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
 		input: m.input as ("text" | "image")[],
 		cost: { ...m.cost },
 		contextWindow: m.contextWindow,
@@ -2055,7 +2113,7 @@ function getScheduledMemberOrder(
 const selectorCache = new Map<string, PoolSelectorFn | null>();
 
 function resolveSelectorScriptPath(scriptPath: string): string {
-	if (scriptPath.startsWith("/")) return scriptPath;
+	if (isAbsolute(scriptPath)) return scriptPath;
 	if (scriptPath.startsWith("~/")) {
 		const home = process.env.HOME || process.env.USERPROFILE || "";
 		return join(home, scriptPath.slice(2));
@@ -2075,7 +2133,8 @@ async function loadSelectorScript(scriptPath: string): Promise<PoolSelectorFn | 
 	}
 
 	try {
-		const mod = await import(resolved);
+		const url = pathToFileURL(resolved).href;
+		const mod = await import(url);
 		const fn: PoolSelectorFn = typeof mod.default === "function"
 			? mod.default
 			: typeof mod === "function"
@@ -2641,16 +2700,17 @@ class PoolManager {
 		errorMessage: string,
 		currentModel: Model<Api> | undefined,
 		ctx: ExtensionContext,
-		lastUserPrompt: string | null,
+		lastTurn: { prompt: string; images?: ImageContent[]; toolExecutionStarted: boolean } | null,
 		config: MultiPassConfig,
 	): Promise<boolean> {
 		if (!currentModel) return false;
 		if (!isRateLimitError(errorMessage)) return false;
 
+		const lastPrompt = lastTurn?.prompt ?? null;
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) return false;
 
-		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
+		const cascade = this.ensureCascadeState(lastPrompt, currentModel);
 
 		// Mark current as exhausted before planning the forward-only cascade.
 		this.markExhausted(currentModel.provider);
@@ -2672,7 +2732,7 @@ class PoolManager {
 			currentModel,
 			ctx,
 			cascade,
-			lastUserPrompt,
+			lastPrompt,
 		);
 
 		const continuation = formatFailoverContinuation(plan.candidates[0]);
@@ -2723,9 +2783,24 @@ class PoolManager {
 		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
 
-		if (lastUserPrompt) {
+		if (lastTurn && lastTurn.toolExecutionStarted) {
+			// Tools already ran; do not auto-replay to avoid duplicate side effects.
+			ctx.ui.notify(
+				`[pool:${pool.name}] Switched to ${nextCandidate.provider}, but the original prompt was not replayed because tools had already executed.`,
+				"warning",
+			);
+		} else if (lastTurn?.prompt) {
+			// Safe to replay: no tools executed yet.
 			this.suppressNextStartTurn = true;
-			this.pi.sendUserMessage(lastUserPrompt);
+			if (lastTurn.images && lastTurn.images.length > 0) {
+				// Preserve images in the replayed prompt.
+				this.pi.sendUserMessage([
+					{ type: "text", text: lastTurn.prompt },
+					...lastTurn.images,
+				]);
+			} else {
+				this.pi.sendUserMessage(lastTurn.prompt);
+			}
 		}
 
 		return true;
@@ -2906,8 +2981,7 @@ async function renameSubscriptionLabel(
 	if (nextLabel === undefined) return;
 
 	entry.label = nextLabel.trim() || undefined;
-	saveGlobalConfig(config);
-
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	const nextName = subDisplayName(entry);
 	if (nextName === previousName) {
 		ctx.ui.notify(`No changes for ${nextName}.`, "info");
@@ -2951,7 +3025,7 @@ async function removeSubscriptionEntry(
 		(candidate) => !(candidate.provider === entry.provider && candidate.index === entry.index),
 	);
 
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	ctx.modelRegistry.refresh();
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Removed ${subDisplayName(entry)}`, "info");
@@ -3097,8 +3171,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	};
 
 	config.subscriptions.push(entry);
-	saveGlobalConfig(config);
-
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	registerSub(pi, entry);
 	ctx.modelRegistry.refresh();
 
@@ -3484,7 +3557,7 @@ async function renamePoolConfig(
 
 	pool.name = trimmedName;
 	const updatedEntries = renamePoolReferences(config.chains, previousName, trimmedName);
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(
 		updatedEntries > 0
@@ -3555,7 +3628,7 @@ async function editPoolMembers(
 				return;
 			}
 			pool.members = [...selectedMembers];
-			saveGlobalConfig(config);
+			notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 			reloadPoolManagerForCurrentProject(ctx, poolManager);
 			ctx.ui.notify(
 				`Updated pool "${pool.name}" with ${pool.members.length} member${pool.members.length === 1 ? "" : "s"}: ${pool.members.join(", ")}.`,
@@ -3774,7 +3847,7 @@ async function createAndPersistPool(
 
 	const config = loadGlobalConfig();
 	const persisted = persistPoolConfig(config, pool);
-	saveGlobalConfig(persisted.config);
+	notifyBackup(saveGlobalConfig(persisted.config), (msg, kind) => ctx.ui.notify(msg, kind));
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 	const resumeSuffix = options?.resumeChainName
@@ -3867,7 +3940,7 @@ async function togglePoolConfig(
 	pool: PoolConfig,
 ): Promise<void> {
 	pool.enabled = !pool.enabled;
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Pool "${pool.name}" is now ${pool.enabled ? "enabled" : "disabled"}`, "info");
 }
@@ -3977,7 +4050,7 @@ async function changePoolStrategy(
 		delete pool.selectorScript;
 	}
 
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 	ctx.ui.notify(`Pool "${pool.name}" strategy changed to ${nextStrategy}.`, "info");
 }
@@ -4005,7 +4078,7 @@ async function removePoolConfig(
 	const removedChains = pruned.removedChains;
 	config.chains = pruned.chains;
 	config.pools = config.pools.filter((candidate) => candidate.name !== pool.name);
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	reloadPoolManagerForCurrentProject(ctx, poolManager);
 
 	let message = `Removed pool "${pool.name}"`;
@@ -4649,7 +4722,7 @@ async function handlePoolChainCreate(
 	}
 
 	latestConfig.chains.push(built.chain);
-	saveGlobalConfig(latestConfig);
+	notifyBackup(saveGlobalConfig(latestConfig), (msg, kind) => ctx.ui.notify(msg, kind));
 	ctx.ui.notify(
 		`Created chain "${built.chain.name}" with ${built.chain.entries.length} ${built.chain.entries.length === 1 ? "entry" : "entries"}.`,
 		"info",
@@ -4689,8 +4762,7 @@ async function handlePoolChainToggle(ctx: ExtensionCommandContext): Promise<void
 	if (idx < 0) return;
 
 	config.chains[idx].enabled = !config.chains[idx].enabled;
-	saveGlobalConfig(config);
-
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	const chain = config.chains[idx];
 	ctx.ui.notify(
 		`Chain "${chain.name}" is now ${chain.enabled ? "enabled" : "disabled"}`,
@@ -4720,7 +4792,7 @@ async function handlePoolChainRemove(ctx: ExtensionCommandContext): Promise<void
 	if (!confirmed) return;
 
 	config.chains.splice(idx, 1);
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	ctx.ui.notify(`Removed chain "${chain.name}"`, "info");
 }
 
@@ -4891,8 +4963,7 @@ async function handlePoolProject(
 			...projectConf,
 			allowedSubs: allowed.length > 0 ? allowed : undefined,
 		};
-		saveProjectConfig(ctx.cwd, newProjectConf);
-
+		notifyBackup(saveProjectConfig(ctx.cwd, newProjectConf), (msg, kind) => ctx.ui.notify(msg, kind));
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
@@ -4932,7 +5003,7 @@ async function handlePoolProject(
 		if (selected2 === "[Use global pools (no override)]") {
 			const newProjectConf: ProjectConfig = { ...projectConf };
 			delete newProjectConf.pools;
-			saveProjectConfig(ctx.cwd, newProjectConf);
+			notifyBackup(saveProjectConfig(ctx.cwd, newProjectConf), (msg, kind) => ctx.ui.notify(msg, kind));
 			const effective = loadEffectiveConfig(ctx.cwd);
 			poolManager.loadPools(effective.pools);
 			ctx.ui.notify("Project will use global pools.", "info");
@@ -4953,7 +5024,7 @@ async function handlePoolProject(
 		}
 
 		const newProjectConf: ProjectConfig = { ...projectConf, pools: projectPools };
-		saveProjectConfig(ctx.cwd, newProjectConf);
+		notifyBackup(saveProjectConfig(ctx.cwd, newProjectConf), (msg, kind) => ctx.ui.notify(msg, kind));
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
@@ -5191,7 +5262,7 @@ async function handlePresetCreate(
 	} else {
 		config.presets.push(preset);
 	}
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	ctx.ui.notify(
 		`Preset "${preset.name}" saved with ${entries.length} ${entries.length === 1 ? "entry" : "entries"}: ${entries.map((e) => formatPresetEntryWith(e, allSubs)).join(", ")}`,
 		"info",
@@ -5302,7 +5373,7 @@ async function handlePresetRemove(ctx: ExtensionCommandContext): Promise<void> {
 	if (!confirmed) return;
 
 	config.presets = config.presets.filter((p) => p.name !== selected);
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	ctx.ui.notify(`Removed preset "${selected}".`, "info");
 }
 
@@ -5329,7 +5400,7 @@ async function handlePresetToggle(ctx: ExtensionCommandContext): Promise<void> {
 	if (!preset) return;
 
 	preset.enabled = !preset.enabled;
-	saveGlobalConfig(config);
+	notifyBackup(saveGlobalConfig(config), (msg, kind) => ctx.ui.notify(msg, kind));
 	ctx.ui.notify(`Preset "${preset.name}" is now ${preset.enabled ? "enabled" : "disabled"}.`, "info");
 }
 
@@ -5479,13 +5550,29 @@ export default function multiSub(pi: ExtensionAPI) {
 		return ok ? { action: "continue" as const } : { action: "handled" as const };
 	});
 
-	// Track last user prompt for retry on rotation
-	let lastUserPrompt: string | null = null;
+	// Track last user input for retry on rotation
+	interface LastTurnInput {
+		prompt: string;
+		images?: ImageContent[];
+		toolExecutionStarted: boolean;
+	}
+	let lastTurnInput: LastTurnInput | null = null;
 
-	// Listen for user input to track last prompt
+	// Listen for user input to track last prompt and images
 	pi.on("before_agent_start", async (event, ctx) => {
-		lastUserPrompt = event.prompt;
+		lastTurnInput = {
+			prompt: event.prompt,
+			images: event.images,
+			toolExecutionStarted: false,
+		};
 		poolManager.startTurn(event.prompt, ctx.model);
+	});
+
+	// Track whether tools executed this turn (to avoid replay after side effects)
+	pi.on("tool_execution_start", async (_event, _ctx) => {
+		if (lastTurnInput) {
+			lastTurnInput.toolExecutionStarted = true;
+		}
 	});
 
 	// Listen for errors to trigger pool rotation
@@ -5504,7 +5591,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			assistantMsg.errorMessage,
 			ctx.model,
 			ctx,
-			lastUserPrompt,
+			lastTurnInput,
 			normalizeMultiPassConfig({
 				subscriptions: effective.subscriptions,
 				pools: effective.pools,
