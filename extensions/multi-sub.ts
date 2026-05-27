@@ -1881,6 +1881,7 @@ function cloneModels(originalProvider: string, index: number) {
 		name: `${m.name} (#${index})`,
 		api: m.api,
 		reasoning: m.reasoning,
+		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
 		input: m.input as ("text" | "image")[],
 		cost: { ...m.cost },
 		contextWindow: m.contextWindow,
