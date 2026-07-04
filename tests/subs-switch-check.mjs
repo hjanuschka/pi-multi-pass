@@ -89,6 +89,18 @@ function resolveSwitchTargetModel({ providerName, preferredModelId, hasAuth, pro
   return undefined;
 }
 
+function computeNextCyclableProviderName({ providerNames, currentProvider, preferredModelId, canResolveModel }) {
+  const currentIndex = currentProvider ? providerNames.findIndex((providerName) => providerName === currentProvider) : -1;
+
+  for (let offset = 1; offset <= providerNames.length; offset += 1) {
+    const providerName = providerNames[(Math.max(currentIndex, -1) + offset) % providerNames.length];
+    if (!providerName || providerName === currentProvider) continue;
+    if (!canResolveModel(providerName, preferredModelId)) continue;
+    return providerName;
+  }
+  return undefined;
+}
+
 function runAllowedProviderFilteringCheck() {
   const providerNames = getSwitchableProviderNames({
     baseProviders: ["openai-codex"],
@@ -130,7 +142,31 @@ function runFallbackModelCheck() {
   assert.equal(model?.id, "gpt-5.3-codex");
 }
 
+function runCycleNextProviderCheck() {
+  const providerName = computeNextCyclableProviderName({
+    providerNames: ["openai-codex", "openai-codex-2", "openai-codex-3"],
+    currentProvider: "openai-codex-2",
+    preferredModelId: "gpt-5.4",
+    canResolveModel: (providerName) => providerName !== "openai-codex-3",
+  });
+
+  assert.equal(providerName, "openai-codex");
+}
+
+function runCycleFromUnknownProviderCheck() {
+  const providerName = computeNextCyclableProviderName({
+    providerNames: ["openai-codex", "openai-codex-2"],
+    currentProvider: "anthropic",
+    preferredModelId: "gpt-5.4",
+    canResolveModel: () => true,
+  });
+
+  assert.equal(providerName, "openai-codex");
+}
+
 runAllowedProviderFilteringCheck();
 runPreferredModelCheck();
 runFallbackModelCheck();
+runCycleNextProviderCheck();
+runCycleFromUnknownProviderCheck();
 console.log("subs switch checks passed");

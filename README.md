@@ -33,6 +33,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 /subs add              Pick a provider, add a subscription
 /login                 Authenticate the new subscription
 /subs switch           Manually switch to another subscription/provider
+ctrl+s                 Cycle to the next authenticated subscription/provider
 /subs limits           Check built-in quota support (Codex + Google)
 /pool create           Group subs into a rotation pool (with strategy selection)
 /pool chain create     Build an ordered fallback chain across pools
@@ -43,6 +44,12 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
 
 ## Commands
+
+### Keyboard shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `ctrl+s` | Cycle to the next authenticated subscription/provider, preserving the current model ID when available |
 
 ### `/subs` -- Subscription management
 

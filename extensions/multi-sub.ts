@@ -2838,6 +2838,41 @@ function resolveSwitchTargetModel(
 	return undefined;
 }
 
+async function handleSubsCycle(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const options = getSwitchableProviderOptions(ctx);
+	if (options.length === 0) {
+		const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd);
+		const suffix = allowedProviderNames && allowedProviderNames.length > 0
+			? ` for this project restriction (${allowedProviderNames.join(", ")})`
+			: "";
+		ctx.ui.notify(`No authenticated subscriptions are available to cycle${suffix}.`, "info");
+		return;
+	}
+
+	const currentProvider = ctx.model?.provider;
+	const currentIndex = currentProvider
+		? options.findIndex((option) => option.providerName === currentProvider)
+		: -1;
+
+	for (let offset = 1; offset <= options.length; offset += 1) {
+		const selected = options[(Math.max(currentIndex, -1) + offset) % options.length];
+		if (!selected || selected.providerName === currentProvider) continue;
+
+		const nextModel = resolveSwitchTargetModel(ctx, selected.providerName, ctx.model?.id);
+		if (!nextModel) continue;
+
+		const success = await pi.setModel(nextModel);
+		if (!success) {
+			ctx.ui.notify(`Failed to switch to ${selected.label}.`, "error");
+			return;
+		}
+		ctx.ui.notify(`Switched to ${selected.label} (${nextModel.id}).`, "info");
+		return;
+	}
+
+	ctx.ui.notify("No other authenticated subscription with a selectable model is available.", "info");
+}
+
 async function handleSubsSwitch(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -5531,6 +5566,13 @@ export default function multiSub(pi: ExtensionAPI) {
 				}
 			}
 		}
+	});
+
+	pi.registerShortcut("ctrl+s", {
+		description: "Cycle to the next authenticated multi-pass subscription/provider",
+		handler: async (ctx: ExtensionContext) => {
+			await handleSubsCycle(pi, ctx);
+		},
 	});
 
 	// Register /subs command
