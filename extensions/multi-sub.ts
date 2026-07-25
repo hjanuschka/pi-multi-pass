@@ -1891,6 +1891,36 @@ function cloneModels(originalProvider: string, index: number) {
 	}));
 }
 
+/**
+ * Clone models from the model registry's live catalog for the base provider.
+ * Unlike cloneModels() (static pi-ai builtin list), this includes remote
+ * catalog updates (e.g. new models pushed via the pi.dev model catalog).
+ * Falls back to the static list when the registry is not yet available.
+ */
+let _modelRegistry: { getAll(): Model<Api>[] } | undefined;
+
+function cloneModelsLive(originalProvider: string, index: number) {
+	if (_modelRegistry) {
+		const live = _modelRegistry.getAll().filter((m) => m.provider === originalProvider);
+		if (live.length > 0) {
+			return live.map((m) => ({
+				id: m.id,
+				name: `${m.name} (#${index})`,
+				api: m.api,
+				reasoning: m.reasoning,
+				thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
+				input: m.input as ("text" | "image")[],
+				cost: { ...m.cost },
+				contextWindow: m.contextWindow,
+				maxTokens: m.maxTokens,
+				headers: m.headers ? { ...m.headers } : undefined,
+				compat: m.compat,
+			}));
+		}
+	}
+	return cloneModels(originalProvider, index);
+}
+
 // ==========================================================================
 // Register a single subscription as a provider
 // ==========================================================================
@@ -1911,6 +1941,9 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 		api: builtinModels[0]?.api,
 		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
+		// Re-clone from the live catalog on each model refresh so remote
+		// catalog updates propagate to cloned subscription providers.
+		refreshModels: async () => cloneModelsLive(entry.provider, entry.index),
 	});
 }
 
@@ -5440,6 +5473,8 @@ export default function multiSub(pi: ExtensionAPI) {
 
 	// On session start, reload pools with project-level config
 	pi.on("session_start", async (_event, ctx) => {
+		// Capture the registry so refreshModels can clone from the live catalog.
+		_modelRegistry = ctx.modelRegistry;
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
