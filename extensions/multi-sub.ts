@@ -47,28 +47,22 @@ import {
 	keyHint,
 } from "@earendil-works/pi-coding-agent";
 import {
-	anthropicOAuthProvider,
 	loginAnthropic,
 	refreshAnthropicToken,
-	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	githubCopilotOAuthProvider,
 	loginGitHubCopilot,
 	refreshGitHubCopilotToken,
 	getGitHubCopilotBaseUrl,
 	normalizeDomain,
-	geminiCliOAuthProvider,
 	loginGeminiCli,
 	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
 	loginAntigravity,
 	refreshAntigravityToken,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
 } from "@earendil-works/pi-ai/oauth";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import { createOAuthInteraction, toOAuthCredential } from "../src/oauth-compat.mts";
 import {
 	Container,
 	Key,
@@ -85,18 +79,24 @@ import {
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
+const openaiCodexOAuth = builtinProviders().find(({ id }) => id === "openai-codex")?.auth.oauth;
+if (!openaiCodexOAuth) {
+	throw new Error("pi-multi-pass: the installed pi-ai OpenAI Codex provider has no OAuth flow");
+}
+
+type RegisteredProviderConfig = Parameters<ExtensionAPI["registerProvider"]>[1];
+type LegacyOAuthProvider = NonNullable<RegisteredProviderConfig["oauth"]>;
+
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
 	usesCallbackServer?: boolean;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
-	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+	buildOAuth(index: number): LegacyOAuthProvider;
+	buildModifyModels?(providerName: string): LegacyOAuthProvider["modifyModels"];
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
 		buildOAuth(index: number) {
 			return {
 				name: `Anthropic #${index}`,
@@ -120,22 +120,16 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
 				name: `ChatGPT Codex #${index}`,
 				usesCallbackServer: true,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginOpenAICodex({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
+					return openaiCodexOAuth.login(createOAuthInteraction(callbacks));
 				},
 				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshOpenAICodexToken(credentials.refresh);
+					return openaiCodexOAuth.refresh(toOAuthCredential(credentials));
 				},
 				getApiKey(credentials: OAuthCredentials): string {
 					return credentials.access;
@@ -146,7 +140,6 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"github-copilot": {
 		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
 		buildOAuth(index: number) {
 			return {
 				name: `GitHub Copilot #${index}`,
@@ -184,7 +177,6 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"google-gemini-cli": {
 		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
@@ -212,7 +204,6 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"google-antigravity": {
 		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return {
