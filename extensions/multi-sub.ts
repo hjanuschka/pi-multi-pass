@@ -69,6 +69,7 @@ import {
 	type OAuthProviderInterface,
 } from "@earendil-works/pi-ai/oauth";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
+import { cloneFromList, cloneModelsLive as cloneModelsLiveCore, type CloneableModel } from "./model-clone.ts";
 import {
 	Container,
 	Key,
@@ -1876,19 +1877,7 @@ function getBaseProvider(providerName: string): string | undefined {
 
 function cloneModels(originalProvider: string, index: number) {
 	const models = getModels(originalProvider as any) as Model<Api>[];
-	return models.map((m) => ({
-		id: m.id,
-		name: `${m.name} (#${index})`,
-		api: m.api,
-		reasoning: m.reasoning,
-		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
-		input: m.input as ("text" | "image")[],
-		cost: { ...m.cost },
-		contextWindow: m.contextWindow,
-		maxTokens: m.maxTokens,
-		headers: m.headers ? { ...m.headers } : undefined,
-		compat: m.compat,
-	}));
+	return cloneFromList(models as unknown as CloneableModel[], index);
 }
 
 /**
@@ -1900,25 +1889,12 @@ function cloneModels(originalProvider: string, index: number) {
 let _modelRegistry: { getAll(): Model<Api>[] } | undefined;
 
 function cloneModelsLive(originalProvider: string, index: number) {
-	if (_modelRegistry) {
-		const live = _modelRegistry.getAll().filter((m) => m.provider === originalProvider);
-		if (live.length > 0) {
-			return live.map((m) => ({
-				id: m.id,
-				name: `${m.name} (#${index})`,
-				api: m.api,
-				reasoning: m.reasoning,
-				thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
-				input: m.input as ("text" | "image")[],
-				cost: { ...m.cost },
-				contextWindow: m.contextWindow,
-				maxTokens: m.maxTokens,
-				headers: m.headers ? { ...m.headers } : undefined,
-				compat: m.compat,
-			}));
-		}
-	}
-	return cloneModels(originalProvider, index);
+	return cloneModelsLiveCore(
+		_modelRegistry as { getAll(): CloneableModel[] } | undefined,
+		originalProvider,
+		index,
+		() => cloneModels(originalProvider, index),
+	);
 }
 
 // ==========================================================================
