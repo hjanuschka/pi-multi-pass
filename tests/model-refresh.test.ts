@@ -26,12 +26,21 @@ test("registerSub passes refreshModels to BOTH registerProvider calls (api_key +
 	assert.ok(end > start, "registerSub end boundary not found");
 	const body = SRC.slice(start, end);
 
+	// Direct count: exactly TWO refreshModels property occurrences in registerSub.
+	// Fails if EITHER call site drops the callback — indentation-independent.
+	const refreshCount = (body.match(/refreshModels\s*[,:]/g) ?? []).length;
+	assert.equal(
+		refreshCount,
+		2,
+		`registerSub must have exactly 2 refreshModels occurrences (one per registerProvider call), found ${refreshCount}`,
+	);
+
+	// Per-call guard: slice by call boundaries (not brace indentation).
 	const callStarts = [...body.matchAll(/pi\.registerProvider\(/g)].map((m) => m.index!);
 	assert.equal(callStarts.length, 2, `expected 2 registerProvider calls, found ${callStarts.length}`);
 
 	for (const [i, callStart] of callStarts.entries()) {
-		const callEnd = body.indexOf("\n\t});", callStart);
-		assert.ok(callEnd > callStart, `registerProvider call #${i + 1} has no closing`);
+		const callEnd = callStarts[i + 1] ?? body.length;
 		const call = body.slice(callStart, callEnd);
 		assert.ok(
 			call.includes("refreshModels"),
