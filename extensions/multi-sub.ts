@@ -30,10 +30,11 @@
  *   - github-copilot     (GitHub Copilot)
  *   - google-gemini-cli  (Google Cloud Code Assist)
  *   - google-antigravity (Antigravity)
+ *   - kiro               (Kiro via pi-provider-kiro-dev)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -45,30 +46,10 @@ import {
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
+	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
-import {
-	anthropicOAuthProvider,
-	loginAnthropic,
-	refreshAnthropicToken,
-	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	githubCopilotOAuthProvider,
-	loginGitHubCopilot,
-	refreshGitHubCopilotToken,
-	getGitHubCopilotBaseUrl,
-	normalizeDomain,
-	geminiCliOAuthProvider,
-	loginGeminiCli,
-	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
-	type OAuthCredentials,
-	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
-} from "@earendil-works/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { cloneKiroProviderConfig, cloneNativeProvider, createDeferredNativeProvider, refreshKiroCredential } from "../lib/provider-helpers.ts";
 import {
 	Container,
 	Key,
@@ -82,164 +63,22 @@ import {
 // Provider templates
 // ==========================================================================
 
-type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
-type GeminiCredentials = OAuthCredentials & { projectId?: string };
-
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
-	usesCallbackServer?: boolean;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
-	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
-	anthropic: {
-		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
-		buildOAuth(index: number) {
-			return {
-				name: `Anthropic #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAnthropic({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshAnthropicToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
-		},
-	},
-
-	"openai-codex": {
-		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
-		usesCallbackServer: true,
-		buildOAuth(index: number) {
-			return {
-				name: `ChatGPT Codex #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginOpenAICodex({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshOpenAICodexToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
-		},
-	},
-
-	"github-copilot": {
-		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
-		buildOAuth(index: number) {
-			return {
-				name: `GitHub Copilot #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGitHubCopilot({
-						onAuth: (url: string, instructions?: string) =>
-							callbacks.onAuth({ url, instructions }),
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						signal: callbacks.signal,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as CopilotCredentials;
-					return refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
-		},
-		buildModifyModels(providerName: string) {
-			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
-				const creds = credentials as CopilotCredentials;
-				const domain = creds.enterpriseUrl
-					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
-					: undefined;
-				const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
-				return models.map((m) =>
-					m.provider === providerName ? { ...m, baseUrl } : m,
-				);
-			};
-		},
-	},
-
-	"google-gemini-cli": {
-		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
-		usesCallbackServer: true,
-		buildOAuth(index: number) {
-			return {
-				name: `Google Cloud Code Assist #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGeminiCli(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshGoogleCloudToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
-		},
-	},
-
-	"google-antigravity": {
-		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
-		usesCallbackServer: true,
-		buildOAuth(index: number) {
-			return {
-				name: `Antigravity #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshAntigravityToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
-		},
-	},
+	anthropic: { displayName: "Anthropic (Claude Pro/Max)" },
+	"openai-codex": { displayName: "ChatGPT Plus/Pro (Codex)" },
+	"github-copilot": { displayName: "GitHub Copilot" },
+	"google-gemini-cli": { displayName: "Google Cloud Code Assist" },
+	"google-antigravity": { displayName: "Antigravity" },
+	kiro: { displayName: "Kiro" },
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
+const providerModelCache = new Map<string, Model<Api>[]>();
+const deferredProviders = new Map<string, ReturnType<typeof createDeferredNativeProvider>>();
 
 // ==========================================================================
 // Built-in quota checking
@@ -280,11 +119,35 @@ interface AuthStorageEntry {
 	[key: string]: unknown;
 }
 
+
+interface AuthStorageAdapter {
+	hasAuth(providerName: string): boolean;
+	get(providerName: string): AuthStorageEntry | undefined;
+	logout(providerName: string): Promise<void>;
+}
+
+function getAuthStorage(
+	ctx: ExtensionContext | ExtensionCommandContext,
+): AuthStorageAdapter {
+	return {
+		hasAuth: (providerName) => ctx.modelRegistry.getProviderAuthStatus(providerName).configured,
+		get: (providerName) => readStoredCredential(providerName) as AuthStorageEntry | undefined,
+		async logout(providerName) {
+			const runtime = (ctx.modelRegistry as unknown as {
+				runtime?: { logout(providerId: string): Promise<void> };
+			}).runtime;
+			if (!runtime) throw new Error("This Pi version cannot log out providers from extensions.");
+			await runtime.logout(providerName);
+		},
+	};
+}
+
 interface QuotaAccount {
 	providerName: string;
 	baseProvider: string;
 	displayName: string;
 	auth?: AuthStorageEntry;
+	refreshOAuth?: (credentials: AuthStorageEntry) => Promise<AuthStorageEntry>;
 }
 
 interface QuotaCheckResult {
@@ -964,13 +827,14 @@ async function resolveGoogleQuotaAccess(
 		&& auth.access.length > 0
 		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
 	if (hasFreshAccess) {
-		return { accessToken: auth.access, projectId };
+		return { accessToken: auth.access as string, projectId };
 	}
 
-	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		const credentials = account.baseProvider === "google-gemini-cli"
-			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
-			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
+	if (typeof auth.refresh === "string" && auth.refresh.length > 0 && account.refreshOAuth) {
+		const credentials = await account.refreshOAuth(auth);
+		if (typeof credentials.access !== "string" || credentials.access.length === 0) {
+			throw new Error("OAuth refresh returned no Google access token.");
+		}
 		return {
 			accessToken: credentials.access,
 			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
@@ -1211,16 +1075,20 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 		if (allowed && !allowed.has(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
+		const oauth = ctx.modelRegistry.getProvider(providerName)?.auth.oauth;
 		accounts.push({
 			providerName,
 			baseProvider: getBaseProvider(providerName) || providerName,
 			displayName,
-			auth: ctx.modelRegistry.authStorage.get(providerName) as AuthStorageEntry | undefined,
+			auth: getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined,
+			refreshOAuth: oauth
+				? (credentials) => oauth.refresh(credentials as never) as Promise<AuthStorageEntry>
+				: undefined,
 		});
 	};
 
 	for (const checker of PROVIDER_QUOTA_CHECKERS) {
-		if (ctx.modelRegistry.authStorage.hasAuth(checker.baseProvider)) {
+		if (getAuthStorage(ctx).hasAuth(checker.baseProvider)) {
 			pushAccount(
 				checker.baseProvider,
 				PROVIDER_TEMPLATES[checker.baseProvider]?.displayName || checker.baseProvider,
@@ -1740,7 +1608,7 @@ function getProjectScopedProviderNames(
 	}
 
 	for (const providerName of SUPPORTED_PROVIDERS) {
-		if (ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+		if (getAuthStorage(ctx).hasAuth(providerName)) {
 			push(providerName);
 		}
 	}
@@ -1755,7 +1623,7 @@ function findSelectableModelForProvider(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -1768,7 +1636,7 @@ function findSelectableModelForProvider(
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of getEffectiveModels(baseProvider, ctx)) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -1870,48 +1738,60 @@ function getBaseProvider(providerName: string): string | undefined {
 	return undefined;
 }
 
-// ==========================================================================
-// Model cloning
-// ==========================================================================
 
-function cloneModels(originalProvider: string, index: number) {
-	const models = getModels(originalProvider as any) as Model<Api>[];
-	return models.map((m) => ({
-		id: m.id,
-		name: `${m.name} (#${index})`,
-		api: m.api,
-		reasoning: m.reasoning,
-		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
-		input: m.input as ("text" | "image")[],
-		cost: { ...m.cost },
-		contextWindow: m.contextWindow,
-		maxTokens: m.maxTokens,
-		headers: m.headers ? { ...m.headers } : undefined,
-		compat: m.compat,
-	}));
+function getEffectiveModels(
+	providerName: string,
+	ctx?: ExtensionContext | ExtensionCommandContext,
+): Model<Api>[] {
+	const current = ctx?.modelRegistry.getProvider(providerName)?.getModels();
+	if (current) {
+		const models = [...current] as Model<Api>[];
+		providerModelCache.set(providerName, models);
+		return models;
+	}
+	return providerModelCache.get(providerName) ?? [];
 }
 
 // ==========================================================================
 // Register a single subscription as a provider
 // ==========================================================================
 
-function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
+function registerSub(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext | ExtensionCommandContext,
+	entry: SubEntry,
+): boolean {
 	const template = PROVIDER_TEMPLATES[entry.provider];
-	if (!template) return;
+	if (!template) return false;
 
-	const name = subProviderName(entry);
-	const oauth = template.buildOAuth(entry.index);
-	const modifyModels = template.buildModifyModels?.(name);
-	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
-	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index);
+	const providerName = subProviderName(entry);
+	const base = ctx.modelRegistry.getProvider(entry.provider);
+	if (!base) return false;
+	providerModelCache.set(entry.provider, [...base.getModels()] as Model<Api>[]);
+	const deferred = deferredProviders.get(providerName);
+	if (deferred) {
+		deferred.bind(base);
+		pi.registerProvider(deferred.provider);
+		return true;
+	}
+	if (ctx.modelRegistry.getProvider(providerName)) return true;
 
-	pi.registerProvider(name, {
-		baseUrl,
-		api: builtinModels[0]?.api,
-		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
-		models,
-	});
+	if (entry.provider === "kiro") {
+		const source = ctx.modelRegistry.getRegisteredProviderConfig("kiro");
+		if (!source) return false;
+		const clone = cloneKiroProviderConfig(
+			source as never,
+			providerName,
+			entry.index,
+			refreshKiroCredential,
+		) as typeof source;
+		pi.registerProvider(providerName, { ...clone, name: subDisplayName(entry) });
+	} else {
+		pi.registerProvider(
+			cloneNativeProvider(base, providerName, subDisplayName(entry), entry.index),
+		);
+	}
+	return true;
 }
 
 // ==========================================================================
@@ -2496,7 +2376,7 @@ class PoolManager {
 				const best = await this.getQuotaBestMember(
 					pool,
 					currentModel.provider,
-					ctx.modelRegistry.authStorage,
+					getAuthStorage(ctx),
 					cascade.attemptedProviders,
 				);
 				if (best) {
@@ -2659,7 +2539,7 @@ class PoolManager {
 		const plan = this.buildFailoverPlan(
 			currentModel,
 			config,
-			ctx.modelRegistry.authStorage,
+			getAuthStorage(ctx),
 			{
 				attemptedProviders: cascade.attemptedProviders,
 				visitedChainIndexes: cascade.visitedChainIndexes,
@@ -2792,7 +2672,7 @@ function getSwitchableProviderOptions(
 	const seen = new Set<string>();
 	const push = (providerName: string, label: string, description: string) => {
 		if (allowed && !allowed.has(providerName)) return;
-		if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) return;
+		if (!getAuthStorage(ctx).hasAuth(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		options.push({ providerName, label, description });
@@ -2816,7 +2696,7 @@ function resolveSwitchTargetModel(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -2829,7 +2709,7 @@ function resolveSwitchTargetModel(
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of getEffectiveModels(baseProvider, ctx)) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -2932,8 +2812,8 @@ async function removeSubscriptionEntry(
 	if (!confirmed) return;
 
 	const name = subProviderName(entry);
-	if (ctx.modelRegistry.authStorage.hasAuth(name)) {
-		ctx.modelRegistry.authStorage.logout(name);
+	if (getAuthStorage(ctx).hasAuth(name)) {
+		await getAuthStorage(ctx).logout(name);
 	}
 	pi.unregisterProvider(name);
 
@@ -2973,7 +2853,7 @@ async function showSubscriptionActions(
 			items: [
 				{
 					value: subProviderName(entry),
-					label: formatSubscriptionListLine(entry, config, ctx.modelRegistry.authStorage),
+					label: formatSubscriptionListLine(entry, config, getAuthStorage(ctx)),
 				},
 			],
 			confirmHint: "back",
@@ -2983,7 +2863,7 @@ async function showSubscriptionActions(
 	}
 
 	const name = subProviderName(entry);
-	const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
+	const hasAuth = getAuthStorage(ctx).hasAuth(name);
 	const actionItems: SelectItem[] = [
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		hasAuth
@@ -3006,13 +2886,13 @@ async function showSubscriptionActions(
 	}
 	if (action === "login") {
 		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
 			"info",
 		);
 		return;
 	}
 	if (action === "logout") {
-		ctx.modelRegistry.authStorage.logout(name);
+		await getAuthStorage(ctx).logout(name);
 		ctx.modelRegistry.refresh();
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
@@ -3045,7 +2925,7 @@ async function handleSubsList(
 			items: all.map((entry) => ({
 				value: subProviderName(entry),
 				label: subDisplayName(entry),
-				description: formatSubscriptionMeta(entry, config, ctx.modelRegistry.authStorage),
+				description: formatSubscriptionMeta(entry, config, getAuthStorage(ctx)),
 			})),
 			initialValue: preferredProviderName,
 			confirmHint: "open",
@@ -3100,7 +2980,9 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	config.subscriptions.push(entry);
 	saveGlobalConfig(config);
 
-	registerSub(pi, entry);
+	if (!registerSub(pi, ctx, entry)) {
+		ctx.ui.notify(`Added ${subDisplayName(entry)}, but the base provider is not registered.`, "warning");
+	}
 	ctx.modelRegistry.refresh();
 
 	const loginNow = await ctx.ui.confirm(
@@ -3110,7 +2992,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 
 	if (loginNow) {
 		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
 			"info",
 		);
 	} else {
@@ -3136,7 +3018,7 @@ async function handleSubsRemove(
 		items: config.subscriptions.map((entry) => ({
 			value: subProviderName(entry),
 			label: subDisplayName(entry),
-			description: ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry))
+			description: getAuthStorage(ctx).hasAuth(subProviderName(entry))
 				? "logged in"
 				: "not logged in",
 		})),
@@ -3159,7 +3041,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const notLoggedIn = all.filter(
-		(entry) => !ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
+		(entry) => !getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (notLoggedIn.length === 0) {
@@ -3190,7 +3072,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	if (!entry) return;
 
 	ctx.ui.notify(
-		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+		`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
 		"info",
 	);
 }
@@ -3201,7 +3083,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const loggedIn = all.filter((entry) =>
-		ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
+		getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (loggedIn.length === 0) {
@@ -3226,7 +3108,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = loggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.modelRegistry.authStorage.logout(subProviderName(entry));
+	await getAuthStorage(ctx).logout(subProviderName(entry));
 	ctx.modelRegistry.refresh();
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
@@ -3244,13 +3126,13 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const lines: string[] = [];
 	for (const entry of all) {
 		const name = subProviderName(entry);
-		const cred = ctx.modelRegistry.authStorage.get(name);
-		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
+		const cred = getAuthStorage(ctx).get(name);
+		const hasAuth = getAuthStorage(ctx).hasAuth(name);
 
 		let status: string;
 		if (!hasAuth) {
 			status = "not logged in";
-		} else if (cred?.type === "oauth") {
+		} else if (cred?.type === "oauth" && typeof cred.expires === "number") {
 			const expiresIn = cred.expires - Date.now();
 			if (expiresIn > 0) {
 				const mins = Math.round(expiresIn / 60000);
@@ -3262,7 +3144,7 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 			status = "logged in (api key)";
 		}
 
-		const modelCount = (getModels(entry.provider as any) as Model<Api>[]).length;
+		const modelCount = getEffectiveModels(entry.provider, ctx).length;
 		const source = config.subscriptions.find(
 			(s) => s.provider === entry.provider && s.index === entry.index,
 		)
@@ -3510,14 +3392,14 @@ async function editPoolMembers(
 		const removableItems: SelectItem[] = selectedMembers.map((member) => ({
 			value: `remove:${member}`,
 			label: `remove ${member}`,
-			description: ctx.modelRegistry.authStorage.hasAuth(member) ? "logged in" : "not logged in",
+			description: getAuthStorage(ctx).hasAuth(member) ? "logged in" : "not logged in",
 		}));
 		const addableItems: SelectItem[] = availableProviders
 			.filter((providerName) => !selectedMembers.includes(providerName))
 			.map((providerName) => ({
 				value: `add:${providerName}`,
 				label: `add ${providerName}`,
-				description: ctx.modelRegistry.authStorage.hasAuth(providerName)
+				description: getAuthStorage(ctx).hasAuth(providerName)
 					? "logged in"
 					: "not logged in",
 			}));
@@ -3605,7 +3487,7 @@ async function promptForPoolDefinition(
 
 	const allProviders = getAllProvidersForBase(baseProvider, allSubs);
 	const authedProviders = allProviders.filter((p) =>
-		ctx.modelRegistry.authStorage.hasAuth(p),
+		getAuthStorage(ctx).hasAuth(p),
 	);
 
 	if (authedProviders.length === 0) {
@@ -3625,7 +3507,7 @@ async function promptForPoolDefinition(
 		const optionsList = [
 			`--- Selected (${members.length}): ${members.join(", ") || "none"} ---`,
 			...remaining.map((p) => {
-				const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+				const authed = getAuthStorage(ctx).hasAuth(p);
 				return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
 			}),
 			"[Done - create pool]",
@@ -3789,7 +3671,7 @@ async function createAndPersistPool(
 }
 
 function getSelectableModelsForPool(pool: PoolConfig): string[] {
-	return (getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id);
+	return getEffectiveModels(pool.baseProvider).map((model) => model.id);
 }
 
 function createChainValidationError(
@@ -3854,7 +3736,7 @@ async function inspectPoolConfig(
 	await showWrappedSelect(ctx, {
 		title: `Pool Status: ${pool.name}`,
 		subtitle: "Press Enter or Escape to go back to the pools list.",
-		items: formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager)
+		items: formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager)
 			.map((line, index) => ({ value: `${index}:${line}`, label: line })),
 		confirmHint: "back",
 		cancelHint: "back",
@@ -4099,7 +3981,7 @@ async function handlePoolList(
 			items: pools.map((pool) => ({
 				value: pool.name,
 				label: pool.name,
-				description: formatPoolListDescription(pool, ctx.modelRegistry.authStorage, poolManager),
+				description: formatPoolListDescription(pool, getAuthStorage(ctx), poolManager),
 			})),
 			initialValue: preferredPoolName,
 			confirmHint: "open",
@@ -4277,7 +4159,7 @@ async function handlePoolStatus(
 	const lines: string[] = [];
 	for (const pool of config.pools) {
 		lines.push(
-			...formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager),
+			...formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager),
 		);
 	}
 
@@ -4670,7 +4552,7 @@ async function handlePoolChainList(
 	await ctx.ui.select(
 		"Chains",
 		config.chains.map((chain) =>
-			formatChainListLine(chain, config, ctx.modelRegistry.authStorage, poolManager),
+			formatChainListLine(chain, config, getAuthStorage(ctx), poolManager),
 		),
 	);
 }
@@ -4750,7 +4632,7 @@ async function handlePoolChainStatus(
 
 	await ctx.ui.select(
 		`Chain Status: ${chain.name}`,
-		formatChainStatusLines(chain, config, ctx.modelRegistry.authStorage, poolManager),
+		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager),
 	);
 }
 
@@ -4838,7 +4720,7 @@ async function handlePoolProject(
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
 			...SUPPORTED_PROVIDERS.filter((p) =>
-				ctx.modelRegistry.authStorage.hasAuth(p),
+				getAuthStorage(ctx).hasAuth(p),
 			),
 			...allSubs.map((s) => subProviderName(s)),
 		];
@@ -4859,7 +4741,7 @@ async function handlePoolProject(
 			const options = [
 				`--- Allowed (${allowed.length}): ${allowed.join(", ") || "all (no restriction)"} ---`,
 				...remaining.map((p) => {
-					const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+					const authed = getAuthStorage(ctx).hasAuth(p);
 					const current = currentAllowed.includes(p) ? " [currently allowed]" : "";
 					return `${p} ${authed ? "[logged in]" : "[not logged in]"}${current}`;
 				}),
@@ -4990,7 +4872,7 @@ async function handlePoolProject(
 		lines.push("");
 		lines.push(`Effective subs (${effective.subscriptions.length}):`);
 		for (const sub of effective.subscriptions) {
-			const authed = ctx.modelRegistry.authStorage.hasAuth(subProviderName(sub));
+			const authed = getAuthStorage(ctx).hasAuth(subProviderName(sub));
 			lines.push(`  ${subDisplayName(sub)} -- ${authed ? "logged in" : "not logged in"}`);
 		}
 
@@ -5169,7 +5051,7 @@ async function handlePresetCreate(
 		const base = getBaseProvider(provider);
 		if (!base) continue;
 
-		const models = (getModels(base as any) as Model<Api>[]).map((m) => m.id);
+		const models = getEffectiveModels(base, ctx).map((model) => model.id);
 		if (models.length === 0) {
 			ctx.ui.notify(`No models available for ${provider}.`, "warning");
 			continue;
@@ -5261,7 +5143,7 @@ async function handlePresetActivate(
 
 	for (const entry of preset.entries) {
 		if (!entry.enabled) continue;
-		if (!ctx.modelRegistry.authStorage.hasAuth(entry.provider)) continue;
+		if (!getAuthStorage(ctx).hasAuth(entry.provider)) continue;
 		const model = ctx.modelRegistry.find(entry.provider, entry.model);
 		if (!model) continue;
 
@@ -5387,9 +5269,18 @@ export default function multiSub(pi: ExtensionAPI) {
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
-	// Register all subscriptions (always global)
 	for (const entry of all) {
-		registerSub(pi, entry);
+		if (entry.provider === "kiro") continue;
+		const models: Model<Api>[] = [];
+		const deferred = createDeferredNativeProvider(
+			entry.provider,
+			models,
+			subProviderName(entry),
+			subDisplayName(entry),
+			entry.index,
+		);
+		deferredProviders.set(subProviderName(entry), deferred);
+		pi.registerProvider(deferred.provider);
 	}
 
 	// Initialize pool manager with global pools (updated on session_start with project config)
@@ -5438,8 +5329,17 @@ export default function multiSub(pi: ExtensionAPI) {
 		return false;
 	};
 
-	// On session start, reload pools with project-level config
+	// Register subscriptions once all effective providers are available.
 	pi.on("session_start", async (_event, ctx) => {
+		for (const providerName of SUPPORTED_PROVIDERS) getEffectiveModels(providerName, ctx);
+		for (const entry of all) {
+			if (!registerSub(pi, ctx, entry)) {
+				ctx.ui.notify(
+					`multi-pass: skipped ${subDisplayName(entry)} because ${entry.provider} is not registered.`,
+					"warning",
+				);
+			}
+		}
 		const effective = loadEffectiveConfig(ctx.cwd);
 		poolManager.loadPools(effective.pools);
 
@@ -5521,7 +5421,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			if (pool) {
 				const available = poolManager.getAvailableMembers(
 					pool,
-					ctx.modelRegistry.authStorage,
+					getAuthStorage(ctx),
 				);
 				if (available.length === 0) {
 					ctx.ui.notify(
@@ -5609,7 +5509,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainMenu(ctx, poolManager);
 						case "list":
 						case "ls":
-							return handlePoolChainList(ctx);
+							return handlePoolChainList(ctx, poolManager);
 						case "toggle":
 							return handlePoolChainToggle(ctx);
 						case "remove":
@@ -5618,7 +5518,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainRemove(ctx);
 						case "status":
 						case "info":
-							return handlePoolChainStatus(ctx);
+							return handlePoolChainStatus(ctx, poolManager);
 						case "create":
 						case "new":
 							return handlePoolChainCreate(ctx, poolManager);

@@ -8,15 +8,15 @@ Multi-subscription extension for [pi](https://github.com/earendil-works/pi-codin
 pi install npm:pi-multi-pass
 ```
 
-Or via git:
+Install this fork via git:
 
 ```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
+pi install git:github.com/mfirdausazizi/pi-multi-pass
 ```
 
 ## Features
 
-- **Multiple subscriptions**: Add extra OAuth accounts for any provider
+- **Multiple subscriptions**: Add extra OAuth accounts for Anthropic, Codex, Copilot, Gemini, Antigravity, and Kiro
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
@@ -26,6 +26,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Project affinity**: Restrict which subs/pools/chains are used per project
 - **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
 - **Labels**: Tag subscriptions (e.g. "work", "personal")
+- **Pi 0.83 auth compatibility**: Clone Pi's native OAuth providers instead of importing removed OAuth helpers
 
 ## Quick start
 
@@ -354,6 +355,22 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 | `github-copilot` | GitHub Copilot |
 | `google-gemini-cli` | Google Cloud Code Assist |
 | `google-antigravity` | Antigravity |
+| `kiro` | Kiro (requires `pi-provider-kiro-dev`) |
+
+### Kiro setup
+
+Install and enable the Kiro provider before multi-pass:
+
+```bash
+pi install npm:pi-provider-kiro-dev
+pi install git:github.com/mfirdausazizi/pi-multi-pass
+```
+
+Multi-pass reuses Kiro's registered stream handler, dynamic model catalog, login flow, and region/profile model metadata. Extra accounts are stored under provider IDs such as `kiro-2`.
+
+During login, selecting Kiro's **Use existing credentials** option explicitly imports the current IDE or `kiro-cli` credential into that extra account. Later refreshes use only that account's stored refresh token and never read from or write to the global Kiro CLI credential database. Unknown credential formats fail closed and require logging in again.
+
+If `pi-provider-kiro-dev` is not registered, the saved Kiro subscription remains configured but multi-pass skips it with a warning.
 
 ## Built-in limits support
 
@@ -378,10 +395,12 @@ Future providers can add another checker without changing the `/subs` command su
 ## Environment variable (optional)
 
 ```bash
-export MULTI_SUB="openai-codex:2,anthropic:1"
+export MULTI_SUB="openai-codex:2,anthropic:1,kiro:1"
 ```
 
 Env entries merge with saved config.
+
+Extra providers are bound to Pi's effective provider registry when a session starts. This is what keeps native Pi 0.83 OAuth behavior and Kiro's provider-specific runtime intact.
 
 ## Config files
 

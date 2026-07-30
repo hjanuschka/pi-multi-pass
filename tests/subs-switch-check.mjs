@@ -130,7 +130,25 @@ function runFallbackModelCheck() {
   assert.equal(model?.id, "gpt-5.3-codex");
 }
 
+
+function runKiroModelCheck() {
+  const model = resolveSwitchTargetModel({
+    providerName: "kiro-2",
+    preferredModelId: "claude-sonnet-4-6",
+    hasAuth: () => true,
+    providerModels: {
+      kiro: [{ id: "claude-sonnet-4-6", kiroModelId: "claude-sonnet-v1" }],
+      "kiro-2": [{ id: "claude-sonnet-4-6", kiroModelId: "claude-sonnet-v1" }],
+    },
+    baseProviderLookup: (providerName) => providerName.replace(/-\d+$/, ""),
+  });
+
+  assert.equal(model?.id, "claude-sonnet-4-6");
+  assert.equal(model?.kiroModelId, "claude-sonnet-v1");
+}
+
 runAllowedProviderFilteringCheck();
 runPreferredModelCheck();
 runFallbackModelCheck();
+runKiroModelCheck();
 console.log("subs switch checks passed");

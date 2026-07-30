@@ -1,7 +1,8 @@
 {
   "name": "pi-multi-pass",
-  "version": "1.3.0",
-  "description": "Multi-subscription extension for pi -- use multiple OAuth accounts per provider (Anthropic, Codex, Copilot, Gemini, Antigravity)",
+  "version": "1.4.0",
+  "type": "module",
+  "description": "Multi-subscription extension for pi -- use multiple OAuth accounts for Anthropic, Codex, Copilot, Gemini, Antigravity, and Kiro",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -9,13 +10,25 @@
     "oauth",
     "codex",
     "anthropic",
-    "copilot"
+    "copilot",
+    "kiro"
   ],
   "license": "MIT",
   "author": "hjanuschka",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hjanuschka/pi-multi-pass"
+    "url": "https://github.com/mfirdausazizi/pi-multi-pass"
+  },
+  "scripts": {
+    "test": "node tests/provider-registration-check.mjs && node tests/kiro-refresh-check.mjs && node tests/pool-edit-check.mjs && node tests/project-aware-limits-check.mjs && node tests/project-restriction-check.mjs && node tests/subs-switch-check.mjs && node tests/subscription-limits-check.mjs && node tests/runtime-failover-check.mjs --retry-start-turn --pool-only --no-loop --failure-path",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0",
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
   },
   "pi": {
     "extensions": [

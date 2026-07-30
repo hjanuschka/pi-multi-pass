@@ -184,7 +184,25 @@ function runUnrestrictedEnvMergeCheck() {
   assert.equal(effective.allowedProviderNames, undefined);
 }
 
+
+function runKiroRestrictionCheck() {
+  const globalConfig = {
+    subscriptions: [{ provider: "kiro", index: 2 }],
+    pools: [{
+      name: "kiro-pool",
+      baseProvider: "kiro",
+      members: ["kiro", "kiro-2"],
+      enabled: true,
+    }],
+    chains: [],
+  };
+  const effective = buildEffectiveConfig(globalConfig, { allowedSubs: ["kiro-2"] });
+  assert.deepEqual(effective.subscriptions.map(subProviderName), ["kiro-2"]);
+  assert.deepEqual(effective.pools[0].members, ["kiro-2"]);
+}
+
 runExactProviderRestrictionCheck();
 runBaseProviderAllowedCheck();
 runUnrestrictedEnvMergeCheck();
+runKiroRestrictionCheck();
 console.log("project restriction checks passed");
