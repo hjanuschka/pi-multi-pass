@@ -2,6 +2,13 @@ import assert from "node:assert/strict";
 import { loginSubscription } from "../extensions/multi-sub.ts";
 
 const notifications = [];
+const opened = [];
+const pi = {
+  async exec(command, args) {
+    opened.push({ command, args });
+    return { code: 0, stdout: "", stderr: "" };
+  },
+};
 let refreshed = 0;
 let loginCall;
 const ctx = {
@@ -42,16 +49,18 @@ const ctx = {
   },
 };
 
-await loginSubscription(ctx, "kiro-2", "Kiro #2");
+await loginSubscription(pi, ctx, "kiro-2", "Kiro #2");
 assert.deepEqual(loginCall, { providerName: "kiro-2", type: "oauth" });
 assert.equal(refreshed, 1);
 assert.ok(notifications.some(({ message }) => message.includes("https://example.com/login")));
 assert.ok(notifications.some(({ message }) => message === "Logged in to Kiro #2"));
+assert.equal(opened.length, 1);
+assert.ok(opened[0].args.includes("https://example.com/login"));
 
 
 let secretInputShown = false;
 const secretNotifications = [];
-await loginSubscription({
+await loginSubscription(pi, {
   modelRegistry: {
     runtime: {
       async login(_providerName, _type, interaction) {

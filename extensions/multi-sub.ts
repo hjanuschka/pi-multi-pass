@@ -168,9 +168,33 @@ async function promptForAuth(ctx: ExtensionCommandContext, prompt: AuthPrompt): 
 	return value;
 }
 
-function notifyAuth(ctx: ExtensionCommandContext, event: AuthEvent): void {
+function openAuthUrl(pi: ExtensionAPI, ctx: ExtensionCommandContext, url: string): void {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		ctx.ui.notify(`Cannot open invalid authentication URL: ${url}`, "warning");
+		return;
+	}
+	if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+		ctx.ui.notify(`Cannot open unsupported authentication URL: ${url}`, "warning");
+		return;
+	}
+
+	const [command, args] = process.platform === "darwin"
+		? ["open", [url]]
+		: process.platform === "win32"
+			? ["cmd.exe", ["/c", "start", "", url]]
+			: ["xdg-open", [url]];
+	void pi.exec(command, args).then((result) => {
+		if (result.code !== 0) ctx.ui.notify(`Open this URL to authenticate:\n${url}`, "warning");
+	}).catch(() => ctx.ui.notify(`Open this URL to authenticate:\n${url}`, "warning"));
+}
+
+function notifyAuth(pi: ExtensionAPI, ctx: ExtensionCommandContext, event: AuthEvent): void {
 	if (event.type === "auth_url") {
 		ctx.ui.notify(`${event.instructions ?? "Open this URL to authenticate:"}\n${event.url}`, "info");
+		openAuthUrl(pi, ctx, event.url);
 	} else if (event.type === "device_code") {
 		ctx.ui.notify(`Open ${event.verificationUri} and enter code ${event.userCode}.`, "info");
 	} else if (event.type === "info") {
@@ -182,6 +206,7 @@ function notifyAuth(ctx: ExtensionCommandContext, event: AuthEvent): void {
 }
 
 export async function loginSubscription(
+	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	providerName: string,
 	displayName: string,
@@ -190,7 +215,7 @@ export async function loginSubscription(
 		const runtime = getModelRuntime(ctx);
 		await runtime.login(providerName, "oauth", {
 			prompt: (prompt) => promptForAuth(ctx, prompt),
-			notify: (event) => notifyAuth(ctx, event),
+			notify: (event) => notifyAuth(pi, ctx, event),
 		});
 		ctx.modelRegistry.refresh();
 		ctx.ui.notify(`Logged in to ${displayName}`, "info");
@@ -2943,7 +2968,7 @@ async function showSubscriptionActions(
 		return renameSubscriptionLabel(ctx, config, entry);
 	}
 	if (action === "login") {
-		return loginSubscription(ctx, name, subDisplayName(entry));
+		return loginSubscription(pi, ctx, name, subDisplayName(entry));
 	}
 	if (action === "logout") {
 		await getAuthStorage(ctx).logout(name);
@@ -3045,7 +3070,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	);
 
 	if (loginNow) {
-		await loginSubscription(ctx, subProviderName(entry), subDisplayName(entry));
+		await loginSubscription(pi, ctx, subProviderName(entry), subDisplayName(entry));
 	} else {
 		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
 	}
@@ -3086,7 +3111,7 @@ async function handleSubsRemove(
 	return removeSubscriptionEntry(pi, ctx, config, entry, poolManager);
 }
 
-async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
+async function handleSubsLogin(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
@@ -3122,7 +3147,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	await loginSubscription(ctx, selectedProviderName, subDisplayName(entry));
+	await loginSubscription(pi, ctx, selectedProviderName, subDisplayName(entry));
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
@@ -5009,7 +5034,7 @@ async function handleSubsMenu(
 				await handleSubsRemove(pi, ctx, poolManager);
 				break;
 			case "login":
-				await handleSubsLogin(ctx);
+				await handleSubsLogin(pi, ctx);
 				break;
 			case "logout":
 				await handleSubsLogout(ctx);
@@ -5508,7 +5533,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "delete":
 					return handleSubsRemove(pi, ctx, poolManager);
 				case "login":
-					return handleSubsLogin(ctx);
+					return handleSubsLogin(pi, ctx);
 				case "logout":
 					return handleSubsLogout(ctx);
 				case "switch":
