@@ -1774,6 +1774,7 @@ function registerSub(
 		pi.registerProvider(deferred.provider);
 		return true;
 	}
+	if (ctx.modelRegistry.getProvider(providerName)) return true;
 
 	if (entry.provider === "kiro") {
 		const source = ctx.modelRegistry.getRegisteredProviderConfig("kiro");
