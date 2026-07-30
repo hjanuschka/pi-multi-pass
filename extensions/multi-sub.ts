@@ -48,7 +48,7 @@ import {
 	keyHint,
 	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AuthEvent, AuthInteraction, AuthPrompt, Model } from "@earendil-works/pi-ai";
 import { cloneKiroProviderConfig, cloneNativeProvider, createDeferredNativeProvider, refreshKiroCredential } from "../lib/provider-helpers.ts";
 import {
 	Container,
@@ -119,6 +119,20 @@ interface AuthStorageEntry {
 	[key: string]: unknown;
 }
 
+interface ExtensionModelRuntime {
+	login(providerName: string, type: "oauth", interaction: AuthInteraction): Promise<unknown>;
+	logout(providerName: string): Promise<void>;
+}
+
+function getModelRuntime(
+	ctx: ExtensionContext | ExtensionCommandContext,
+): ExtensionModelRuntime {
+	const runtime = (ctx.modelRegistry as unknown as {
+		runtime?: ExtensionModelRuntime;
+	}).runtime;
+	if (!runtime) throw new Error("This Pi version cannot authenticate providers from extensions.");
+	return runtime;
+}
 
 interface AuthStorageAdapter {
 	hasAuth(providerName: string): boolean;
@@ -132,14 +146,58 @@ function getAuthStorage(
 	return {
 		hasAuth: (providerName) => ctx.modelRegistry.getProviderAuthStatus(providerName).configured,
 		get: (providerName) => readStoredCredential(providerName) as AuthStorageEntry | undefined,
-		async logout(providerName) {
-			const runtime = (ctx.modelRegistry as unknown as {
-				runtime?: { logout(providerId: string): Promise<void> };
-			}).runtime;
-			if (!runtime) throw new Error("This Pi version cannot log out providers from extensions.");
-			await runtime.logout(providerName);
-		},
+		logout: (providerName) => getModelRuntime(ctx).logout(providerName),
 	};
+}
+
+async function promptForAuth(ctx: ExtensionCommandContext, prompt: AuthPrompt): Promise<string> {
+	if (prompt.type === "secret") {
+		throw new Error("This authentication method requires a secure prompt; use Pi's /login command.");
+	}
+
+	let value: string | undefined;
+	if (prompt.type === "select") {
+		const labels = prompt.options.map((option, index) => `${index + 1}. ${option.label}`);
+		const selected = await ctx.ui.select(prompt.message, labels, { signal: prompt.signal });
+		const selectedIndex = selected === undefined ? -1 : labels.indexOf(selected);
+		value = prompt.options[selectedIndex]?.id;
+	} else {
+		value = await ctx.ui.input(prompt.message, prompt.placeholder, { signal: prompt.signal });
+	}
+	if (value === undefined) throw new Error("Login cancelled");
+	return value;
+}
+
+function notifyAuth(ctx: ExtensionCommandContext, event: AuthEvent): void {
+	if (event.type === "auth_url") {
+		ctx.ui.notify(`${event.instructions ?? "Open this URL to authenticate:"}\n${event.url}`, "info");
+	} else if (event.type === "device_code") {
+		ctx.ui.notify(`Open ${event.verificationUri} and enter code ${event.userCode}.`, "info");
+	} else if (event.type === "info") {
+		const links = event.links?.map((link) => link.url).join("\n");
+		ctx.ui.notify(links ? `${event.message}\n${links}` : event.message, "info");
+	} else {
+		ctx.ui.notify(event.message, "info");
+	}
+}
+
+export async function loginSubscription(
+	ctx: ExtensionCommandContext,
+	providerName: string,
+	displayName: string,
+): Promise<void> {
+	try {
+		const runtime = getModelRuntime(ctx);
+		await runtime.login(providerName, "oauth", {
+			prompt: (prompt) => promptForAuth(ctx, prompt),
+			notify: (event) => notifyAuth(ctx, event),
+		});
+		ctx.modelRegistry.refresh();
+		ctx.ui.notify(`Logged in to ${displayName}`, "info");
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (message !== "Login cancelled") ctx.ui.notify(`Login failed: ${message}`, "error");
+	}
 }
 
 interface QuotaAccount {
@@ -2868,7 +2926,7 @@ async function showSubscriptionActions(
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		hasAuth
 			? { value: "logout", label: "logout", description: "Log out this subscription" }
-			: { value: "login", label: "login", description: "Show login instructions" },
+			: { value: "login", label: "login", description: "Log in to this subscription" },
 		{ value: "remove", label: "remove", description: "Remove this subscription" },
 	];
 
@@ -2885,11 +2943,7 @@ async function showSubscriptionActions(
 		return renameSubscriptionLabel(ctx, config, entry);
 	}
 	if (action === "login") {
-		ctx.ui.notify(
-			`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
-			"info",
-		);
-		return;
+		return loginSubscription(ctx, name, subDisplayName(entry));
 	}
 	if (action === "logout") {
 		await getAuthStorage(ctx).logout(name);
@@ -2991,10 +3045,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	);
 
 	if (loginNow) {
-		ctx.ui.notify(
-			`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
-			"info",
-		);
+		await loginSubscription(ctx, subProviderName(entry), subDisplayName(entry));
 	} else {
 		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
 	}
@@ -3056,7 +3107,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 
 	const selectedProviderName = await showWrappedSelect(ctx, {
 		title: "Login to subscription",
-		subtitle: "Select a subscription to see login instructions.",
+		subtitle: "Select a subscription to authenticate.",
 		initialValue: ctx.model?.provider,
 		items: notLoggedIn.map((entry) => ({
 			value: subProviderName(entry),
@@ -3071,10 +3122,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.ui.notify(
-		`Use /login and select "${subDisplayName(entry)}" to authenticate.`,
-		"info",
-	);
+	await loginSubscription(ctx, selectedProviderName, subDisplayName(entry));
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {

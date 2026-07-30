@@ -20,7 +20,7 @@
     "url": "https://github.com/mfirdausazizi/pi-multi-pass"
   },
   "scripts": {
-    "test": "node tests/provider-registration-check.mjs && node tests/kiro-refresh-check.mjs && node tests/pool-edit-check.mjs && node tests/project-aware-limits-check.mjs && node tests/project-restriction-check.mjs && node tests/subs-switch-check.mjs && node tests/subscription-limits-check.mjs && node tests/runtime-failover-check.mjs --retry-start-turn --pool-only --no-loop --failure-path",
+    "test": "node tests/provider-registration-check.mjs && node tests/subs-login-check.mjs && node tests/kiro-refresh-check.mjs && node tests/pool-edit-check.mjs && node tests/project-aware-limits-check.mjs && node tests/project-restriction-check.mjs && node tests/subs-switch-check.mjs && node tests/subscription-limits-check.mjs && node tests/runtime-failover-check.mjs --retry-start-turn --pool-only --no-loop --failure-path",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -143,6 +143,8 @@ async function runSourceCompatibilityChecks() {
   ]) {
     assert.ok(source.includes(provider), `missing provider template: ${provider}`);
   }
+  assert.match(source, /runtime\.login\(providerName, "oauth"/);
+  assert.doesNotMatch(source, /Show login instructions|Use \/login and select/);
 }
 
 await runNativeProviderCloneChecks();
