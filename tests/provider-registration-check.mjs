@@ -143,6 +143,11 @@ async function runSourceCompatibilityChecks() {
   ]) {
     assert.ok(source.includes(provider), `missing provider template: ${provider}`);
   }
+
+
+  const packagePath = fileURLToPath(new URL("../package.json", import.meta.url));
+  const packageJson = JSON.parse(await readFile(packagePath, "utf8"));
+  assert.notEqual(packageJson.type, "module", "Pi package discovery does not load this extension as type=module");
 }
 
 await runNativeProviderCloneChecks();

@@ -1,7 +1,6 @@
 {
   "name": "pi-multi-pass",
   "version": "1.4.0",
-  "type": "module",
   "description": "Multi-subscription extension for pi -- use multiple OAuth accounts for Anthropic, Codex, Copilot, Gemini, Antigravity, and Kiro",
   "keywords": [
     "pi-package",
