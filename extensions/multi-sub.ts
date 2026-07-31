@@ -30,6 +30,8 @@
  *   - github-copilot     (GitHub Copilot)
  *   - google-gemini-cli  (Google Cloud Code Assist)
  *   - google-antigravity (Antigravity)
+ *   - minimax             (MiniMax global API key)
+ *   - minimax-cn          (MiniMax China API key)
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
@@ -87,11 +89,17 @@ type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
+	builtinOAuth?: OAuthProviderInterface;
 	usesCallbackServer?: boolean;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
+	apiKey?: string;
+	baseUrl?: string;
+	api?: Api;
+	modelIds?: readonly string[];
+	buildOAuth?(index: number): Omit<OAuthProviderInterface, "id">;
 	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
 }
+
+const MINIMAX_MODEL_IDS = ["MiniMax-M3", "MiniMax-M2.7"] as const;
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
@@ -236,6 +244,22 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 				},
 			};
 		},
+	},
+
+	minimax: {
+		displayName: "MiniMax (Global)",
+		apiKey: "$MINIMAX_API_KEY",
+		baseUrl: "https://api.minimax.io/anthropic",
+		api: "anthropic-messages",
+		modelIds: MINIMAX_MODEL_IDS,
+	},
+
+	"minimax-cn": {
+		displayName: "MiniMax (China)",
+		apiKey: "$MINIMAX_CN_API_KEY",
+		baseUrl: "https://api.minimaxi.com/anthropic",
+		api: "anthropic-messages",
+		modelIds: MINIMAX_MODEL_IDS,
 	},
 };
 
@@ -1860,6 +1884,11 @@ function subDisplayName(entry: SubEntry): string {
 	return `${entry.label} — ${providerName}`;
 }
 
+function subscriptionLoginName(entry: SubEntry): string {
+	const oauth = PROVIDER_TEMPLATES[entry.provider]?.buildOAuth?.(entry.index);
+	return oauth?.name || subProviderName(entry);
+}
+
 /** Get the base provider type from a provider name, e.g. "openai-codex-2" -> "openai-codex" */
 function getBaseProvider(providerName: string): string | undefined {
 	// Direct match
@@ -1874,8 +1903,13 @@ function getBaseProvider(providerName: string): string | undefined {
 // Model cloning
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number) {
-	const models = getModels(originalProvider as any) as Model<Api>[];
+function cloneModels(originalProvider: string, index: number, modelIds?: readonly string[]) {
+	const availableModels = getModels(originalProvider as any) as Model<Api>[];
+	const models = modelIds
+		? modelIds
+			.map((modelId) => availableModels.find((model) => model.id === modelId))
+			.filter((model): model is Model<Api> => model !== undefined)
+		: availableModels;
 	return models.map((m) => ({
 		id: m.id,
 		name: `${m.name} (#${index})`,
@@ -1900,16 +1934,22 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	if (!template) return;
 
 	const name = subProviderName(entry);
-	const oauth = template.buildOAuth(entry.index);
-	const modifyModels = template.buildModifyModels?.(name);
+	const oauth = template.buildOAuth?.(entry.index);
+	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
-	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index);
+	const baseUrl = template.baseUrl || builtinModels[0]?.baseUrl || "";
+	const models = cloneModels(entry.provider, entry.index, template.modelIds);
+	const oauthConfig = oauth
+		? modifyModels
+			? { ...oauth, modifyModels }
+			: oauth
+		: undefined;
 
 	pi.registerProvider(name, {
 		baseUrl,
-		api: builtinModels[0]?.api,
-		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
+		api: template.api || builtinModels[0]?.api,
+		apiKey: template.apiKey,
+		oauth: oauthConfig,
 		models,
 	});
 }
@@ -3006,7 +3046,7 @@ async function showSubscriptionActions(
 	}
 	if (action === "login") {
 		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			`Use /login and select "${subscriptionLoginName(entry)}" to authenticate.`,
 			"info",
 		);
 		return;
@@ -3110,7 +3150,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 
 	if (loginNow) {
 		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+			`Use /login and select "${subscriptionLoginName(entry)}" to authenticate.`,
 			"info",
 		);
 	} else {
@@ -3190,7 +3230,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	if (!entry) return;
 
 	ctx.ui.notify(
-		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
+		`Use /login and select "${subscriptionLoginName(entry)}" to authenticate.`,
 		"info",
 	);
 }
