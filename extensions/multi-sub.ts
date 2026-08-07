@@ -65,9 +65,11 @@ import {
 	antigravityOAuthProvider,
 	loginAntigravity,
 	refreshAntigravityToken,
-	type OAuthCredentials,
-	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
+} from "./lib/oauth-compat.js";
+import type {
+	OAuthCredentials,
+	OAuthLoginCallbacks,
+	OAuthProviderInterface,
 } from "@earendil-works/pi-ai/oauth";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
 import {

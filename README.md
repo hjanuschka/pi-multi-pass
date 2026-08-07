@@ -42,6 +42,10 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 
 When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
 
+### OpenAI Codex login flow
+
+Logging in to a Codex subscription (base account or `openai-codex-2` / `openai-codex-3`, …) uses the same OAuth flow as pi itself: pi opens the OpenAI authorization page and captures the callback at `http://localhost:1455/auth/callback` with a local callback server, so the login completes automatically. You can choose between **Browser login** (default) and **Device code login (headless)** when pi prompts you. If port `1455` is already taken, pi falls back to asking you to paste the redirect URL manually.
+
 ## Commands
 
 ### `/subs` -- Subscription management
