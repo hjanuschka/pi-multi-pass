@@ -39,6 +39,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
+	ProviderConfig,
 } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
@@ -50,9 +51,14 @@ import * as legacyOAuth from "@earendil-works/pi-ai/oauth";
 import {
 	getModels,
 	type Api,
+	type AuthEvent,
+	type AuthPrompt,
 	type Model,
+	type OAuthCredential,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
+	type Provider,
+	type ProviderAuthInteraction,
 } from "@earendil-works/pi-ai";
 import {
 	Container,
@@ -70,48 +76,12 @@ import {
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
-type NativeOAuthPrompt =
-	| { type: "text" | "secret" | "manual_code"; message: string; placeholder?: string }
-	| {
-			type: "select";
-			message: string;
-			options: readonly { id: string; label: string; description?: string }[];
-	  };
-
-type NativeOAuthEvent =
-	| { type: "auth_url"; url: string; instructions?: string }
-	| {
-			type: "device_code";
-			userCode: string;
-			verificationUri: string;
-			intervalSeconds?: number;
-			expiresInSeconds?: number;
-	  }
-	| { type: "progress" | "info"; message: string };
-
-interface NativeOAuthInteraction {
-	signal: AbortSignal;
-	prompt(prompt: NativeOAuthPrompt): Promise<string>;
-	notify(event: NativeOAuthEvent): void;
-}
-
-interface NativeOAuthProvider {
-	name: string;
-	isSubscription?: boolean;
-	login(interaction: NativeOAuthInteraction): Promise<OAuthCredentials>;
-	refresh(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials>;
-}
-
-interface NativeProvider {
-	id: string;
-	auth?: { oauth?: NativeOAuthProvider };
-}
-
+type NativeOAuthProvider = NonNullable<Provider["auth"]["oauth"]>;
 type LegacyOAuthModule = Record<string, unknown>;
 type LegacyOAuthFunction = (...args: any[]) => any;
 
 const legacyOAuthModule = legacyOAuth as unknown as LegacyOAuthModule;
-let nativeProvidersPromise: Promise<NativeProvider[]> | undefined;
+let nativeProvidersPromise: Promise<Provider[]> | undefined;
 
 async function getNativeOAuth(providerId: string): Promise<NativeOAuthProvider | undefined> {
 	nativeProvidersPromise ??= (async () => {
@@ -121,9 +91,7 @@ async function getNativeOAuth(providerId: string): Promise<NativeOAuthProvider |
 		];
 		for (const load of loaders) {
 			try {
-				const module = (await load()) as {
-					builtinProviders?: () => NativeProvider[];
-				};
+				const module = (await load()) as { builtinProviders?: () => Provider[] };
 				if (typeof module.builtinProviders !== "function") continue;
 				return module.builtinProviders();
 			} catch {
@@ -145,24 +113,16 @@ function getLegacyOAuthFunction<T extends LegacyOAuthFunction>(name: string): T 
 	return fn as T;
 }
 
-function toNativeOAuthInteraction(callbacks: OAuthLoginCallbacks): NativeOAuthInteraction {
+function toNativeOAuthInteraction(callbacks: OAuthLoginCallbacks): ProviderAuthInteraction {
 	const legacyCallbacks = callbacks as OAuthLoginCallbacks & {
-		onDeviceCode?: (info: {
-			userCode: string;
-			verificationUri: string;
-			intervalSeconds?: number;
-			expiresInSeconds?: number;
-		}) => void;
-		onSelect?: (prompt: {
-			message: string;
-			options: { id: string; label: string }[];
-		}) => Promise<string | undefined>;
+		onDeviceCode?: OAuthLoginCallbacks["onDeviceCode"];
+		onSelect?: OAuthLoginCallbacks["onSelect"];
 	};
 	const signal = callbacks.signal ?? new AbortController().signal;
 
 	return {
 		signal,
-		async prompt(prompt: NativeOAuthPrompt): Promise<string> {
+		async prompt(prompt: AuthPrompt): Promise<string> {
 			if (prompt.type === "select") {
 				if (legacyCallbacks.onSelect) {
 					const selected = await legacyCallbacks.onSelect({
@@ -173,14 +133,23 @@ function toNativeOAuthInteraction(callbacks: OAuthLoginCallbacks): NativeOAuthIn
 					return selected;
 				}
 				const options = prompt.options.map((option) => option.label).join(", ");
-				return callbacks.onPrompt({ message: `${prompt.message} (${options})` });
+				const legacyPrompt = {
+					message: `${prompt.message} (${options})`,
+					signal: prompt.signal,
+				};
+				return callbacks.onPrompt(legacyPrompt);
 			}
 			if (prompt.type === "manual_code" && callbacks.onManualCodeInput) {
 				return callbacks.onManualCodeInput();
 			}
-			return callbacks.onPrompt({ message: prompt.message, placeholder: prompt.placeholder });
+			const legacyPrompt = {
+				message: prompt.message,
+				placeholder: prompt.placeholder,
+				signal: prompt.signal,
+			};
+			return callbacks.onPrompt(legacyPrompt);
 		},
-		notify(event: NativeOAuthEvent): void {
+		notify(event: AuthEvent): void {
 			switch (event.type) {
 				case "auth_url":
 					callbacks.onAuth({ url: event.url, instructions: event.instructions });
@@ -198,13 +167,37 @@ function toNativeOAuthInteraction(callbacks: OAuthLoginCallbacks): NativeOAuthIn
 	};
 }
 
+type LegacyOAuthLoginOptions = {
+	onAuth: OAuthLoginCallbacks["onAuth"];
+	onPrompt: OAuthLoginCallbacks["onPrompt"];
+	onProgress?: OAuthLoginCallbacks["onProgress"];
+	onManualCodeInput?: OAuthLoginCallbacks["onManualCodeInput"];
+	signal?: AbortSignal;
+};
+type LegacyCopilotLoginOptions = {
+	onAuth: (url: string, instructions?: string) => void;
+	onPrompt: OAuthLoginCallbacks["onPrompt"];
+	onProgress?: OAuthLoginCallbacks["onProgress"];
+	signal?: AbortSignal;
+};
+type LegacyGoogleLogin = (
+	onAuth: OAuthLoginCallbacks["onAuth"],
+	onProgress?: OAuthLoginCallbacks["onProgress"],
+	onManualCodeInput?: OAuthLoginCallbacks["onManualCodeInput"],
+) => Promise<OAuthCredentials>;
+type LegacyOAuthLogin = (options: LegacyOAuthLoginOptions) => Promise<OAuthCredentials>;
+type LegacyCopilotLogin = (options: LegacyCopilotLoginOptions) => Promise<OAuthCredentials>;
+type LegacyOAuthRefresh = (refresh: string) => Promise<OAuthCredentials>;
+type LegacyCopilotRefresh = (refresh: string, enterpriseDomain?: string) => Promise<OAuthCredentials>;
+type LegacyProjectRefresh = (refresh: string, projectId: string) => Promise<OAuthCredentials>;
+
 async function loginWithLegacyOAuth(
 	providerId: string,
 	callbacks: OAuthLoginCallbacks,
 ): Promise<OAuthCredentials> {
 	switch (providerId) {
 		case "anthropic":
-			return getLegacyOAuthFunction<any>("loginAnthropic")({
+			return getLegacyOAuthFunction<LegacyOAuthLogin>("loginAnthropic")({
 				onAuth: callbacks.onAuth,
 				onPrompt: callbacks.onPrompt,
 				onProgress: callbacks.onProgress,
@@ -212,7 +205,7 @@ async function loginWithLegacyOAuth(
 				signal: callbacks.signal,
 			});
 		case "openai-codex":
-			return getLegacyOAuthFunction<any>("loginOpenAICodex")({
+			return getLegacyOAuthFunction<LegacyOAuthLogin>("loginOpenAICodex")({
 				onAuth: callbacks.onAuth,
 				onPrompt: callbacks.onPrompt,
 				onProgress: callbacks.onProgress,
@@ -220,20 +213,20 @@ async function loginWithLegacyOAuth(
 				signal: callbacks.signal,
 			});
 		case "github-copilot":
-			return getLegacyOAuthFunction<any>("loginGitHubCopilot")({
+			return getLegacyOAuthFunction<LegacyCopilotLogin>("loginGitHubCopilot")({
 				onAuth: (url: string, instructions?: string) => callbacks.onAuth({ url, instructions }),
 				onPrompt: callbacks.onPrompt,
 				onProgress: callbacks.onProgress,
 				signal: callbacks.signal,
 			});
 		case "google-gemini-cli":
-			return getLegacyOAuthFunction<any>("loginGeminiCli")(
+			return getLegacyOAuthFunction<LegacyGoogleLogin>("loginGeminiCli")(
 				callbacks.onAuth,
 				callbacks.onProgress,
 				callbacks.onManualCodeInput,
 			);
 		case "google-antigravity":
-			return getLegacyOAuthFunction<any>("loginAntigravity")(
+			return getLegacyOAuthFunction<LegacyGoogleLogin>("loginAntigravity")(
 				callbacks.onAuth,
 				callbacks.onProgress,
 				callbacks.onManualCodeInput,
@@ -249,26 +242,59 @@ async function refreshWithLegacyOAuth(
 ): Promise<OAuthCredentials> {
 	switch (providerId) {
 		case "anthropic":
-			return getLegacyOAuthFunction<any>("refreshAnthropicToken")(credentials.refresh);
+			return getLegacyOAuthFunction<LegacyOAuthRefresh>("refreshAnthropicToken")(credentials.refresh);
 		case "openai-codex":
-			return getLegacyOAuthFunction<any>("refreshOpenAICodexToken")(credentials.refresh);
+			return getLegacyOAuthFunction<LegacyOAuthRefresh>("refreshOpenAICodexToken")(credentials.refresh);
 		case "github-copilot": {
 			const creds = credentials as CopilotCredentials;
-			return getLegacyOAuthFunction<any>("refreshGitHubCopilotToken")(creds.refresh, creds.enterpriseUrl);
+			return getLegacyOAuthFunction<LegacyCopilotRefresh>("refreshGitHubCopilotToken")(
+				creds.refresh,
+				creds.enterpriseUrl,
+			);
 		}
 		case "google-gemini-cli": {
 			const creds = credentials as GeminiCredentials;
 			if (!creds.projectId) throw new Error("Missing projectId");
-			return getLegacyOAuthFunction<any>("refreshGoogleCloudToken")(creds.refresh, creds.projectId);
+			return getLegacyOAuthFunction<LegacyProjectRefresh>("refreshGoogleCloudToken")(
+				creds.refresh,
+				creds.projectId,
+			);
 		}
 		case "google-antigravity": {
 			const creds = credentials as GeminiCredentials;
 			if (!creds.projectId) throw new Error("Missing projectId");
-			return getLegacyOAuthFunction<any>("refreshAntigravityToken")(creds.refresh, creds.projectId);
+			return getLegacyOAuthFunction<LegacyProjectRefresh>("refreshAntigravityToken")(
+				creds.refresh,
+				creds.projectId,
+			);
 		}
 		default:
 			throw new Error(`Unsupported OAuth provider: ${providerId}`);
 	}
+}
+
+async function loginOAuth(
+	providerId: string,
+	callbacks: OAuthLoginCallbacks,
+): Promise<OAuthCredentials> {
+	const native = await getNativeOAuth(providerId);
+	if (native) return native.login(toNativeOAuthInteraction(callbacks));
+	return loginWithLegacyOAuth(providerId, callbacks);
+}
+
+async function refreshOAuth(
+	providerId: string,
+	credentials: OAuthCredentials,
+	signal?: AbortSignal,
+): Promise<OAuthCredentials> {
+	const native = await getNativeOAuth(providerId);
+	if (native) {
+		return native.refresh(
+			credentials as OAuthCredential,
+			signal ?? new AbortController().signal,
+		);
+	}
+	return refreshWithLegacyOAuth(providerId, credentials);
 }
 
 function buildOAuthAdapter(
@@ -281,14 +307,8 @@ function buildOAuthAdapter(
 		name,
 		isSubscription: true,
 		...(usesCallbackServer ? { usesCallbackServer: true } : {}),
-		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-			const native = await getNativeOAuth(providerId);
-			return native ? native.login(toNativeOAuthInteraction(callbacks)) : loginWithLegacyOAuth(providerId, callbacks);
-		},
-		async refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials> {
-			const native = await getNativeOAuth(providerId);
-			return native ? native.refresh(credentials, signal) : refreshWithLegacyOAuth(providerId, credentials);
-		},
+		login: (callbacks) => loginOAuth(providerId, callbacks),
+		refreshToken: (credentials, signal) => refreshOAuth(providerId, credentials, signal),
 		getApiKey,
 	};
 }
@@ -311,19 +331,10 @@ function getGitHubCopilotBaseUrl(token?: string, enterpriseDomain?: string): str
 	return "https://api.individual.githubcopilot.com";
 }
 
-interface MultiPassOAuth {
-	name: string;
-	isSubscription?: boolean;
-	usesCallbackServer?: boolean;
-	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
-	refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials>;
-	getApiKey(credentials: OAuthCredentials): string;
-	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
-}
+type MultiPassOAuth = NonNullable<ProviderConfig["oauth"]>;
 
 interface ProviderTemplate {
 	displayName: string;
-	usesCallbackServer?: boolean;
 	buildOAuth(index: number): MultiPassOAuth;
 	buildModifyModels?(providerName: string): MultiPassOAuth["modifyModels"];
 }
@@ -338,7 +349,6 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return buildOAuthAdapter("openai-codex", `ChatGPT Codex #${index}`, true);
 		},
@@ -352,35 +362,48 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		buildModifyModels(providerName: string) {
 			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
 				const creds = credentials as CopilotCredentials;
-				const domain = creds.enterpriseUrl ? (normalizeDomain(creds.enterpriseUrl) ?? undefined) : undefined;
+				const domain = creds.enterpriseUrl
+					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
+					: undefined;
 				const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
-				return models.map((m) => m.provider === providerName ? { ...m, baseUrl } : m);
+				return models.map((m) =>
+					m.provider === providerName ? { ...m, baseUrl } : m,
+				);
 			};
 		},
 	},
 
 	"google-gemini-cli": {
 		displayName: "Google Cloud Code Assist",
-		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return buildOAuthAdapter("google-gemini-cli", `Google Cloud Code Assist #${index}`, true, (credentials) => {
-				const creds = credentials as GeminiCredentials;
-				return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-			});
+			return buildOAuthAdapter(
+				"google-gemini-cli",
+				`Google Cloud Code Assist #${index}`,
+				true,
+				(credentials) => {
+					const creds = credentials as GeminiCredentials;
+					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
+				},
+			);
 		},
 	},
 
 	"google-antigravity": {
 		displayName: "Antigravity",
-		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return buildOAuthAdapter("google-antigravity", `Antigravity #${index}`, true, (credentials) => {
-				const creds = credentials as GeminiCredentials;
-				return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-			});
+			return buildOAuthAdapter(
+				"google-antigravity",
+				`Antigravity #${index}`,
+				true,
+				(credentials) => {
+					const creds = credentials as GeminiCredentials;
+					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
+				},
+			);
 		},
 	},
 };
+
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 
 // ==========================================================================
@@ -412,26 +435,19 @@ const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
 
 type QuotaStatusKind = "ready" | "watch" | "low" | "blocked" | "error" | "missing-auth";
 
-interface AuthStorageEntry {
+type AuthStorageEntry = OAuthCredentials & {
 	type?: string;
-	access?: string;
-	refresh?: string;
-	expires?: number;
 	accountId?: string;
 	projectId?: string;
-	[key: string]: unknown;
-}
+};
 
-// --------------------------------------------------------------------------
+// ==========================================================================
 // Auth compatibility adapter
 //
-// pi >= 0.80 replaced the extension-facing AuthStorage property
-// (AuthStorage) with the async ModelRuntime credential APIs; ModelRegistry no
-// longer exposes a storage object. This adapter transparently falls back to
-// the legacy storage when present, and otherwise mirrors the old synchronous
-// surface by reading auth.json (the same store /login and /logout use) and by
-// delegating logout to the internal model runtime when reachable.
-// --------------------------------------------------------------------------
+// pi >= 0.80 moved credential access from modelRegistry.authStorage to the
+// model runtime. Keep the old synchronous surface used by this extension,
+// backed by auth.json for reads and the runtime for logout.
+// ==========================================================================
 
 interface AuthAdapter {
 	hasAuth(provider: string): boolean;
@@ -444,7 +460,7 @@ function readStoredAuthEntries(): Record<string, AuthStorageEntry> | undefined {
 		const authPath = join(getAgentDir(), "auth.json");
 		if (!existsSync(authPath)) return undefined;
 		const parsed = JSON.parse(readFileSync(authPath, "utf8"));
-		return parsed && typeof parsed === "object"
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
 			? (parsed as Record<string, AuthStorageEntry>)
 			: undefined;
 	} catch {
@@ -458,7 +474,7 @@ interface ModelRegistryCompat {
 	runtime?: { logout?(provider: string): Promise<unknown> };
 }
 
-function authStorageOf(ctx: { modelRegistry: unknown }): AuthAdapter {
+function getAuthStorage(ctx: { modelRegistry: unknown }): AuthAdapter {
 	const registry = ctx.modelRegistry as ModelRegistryCompat;
 	const legacy = registry.authStorage;
 	if (legacy && typeof legacy.hasAuth === "function") {
@@ -1165,19 +1181,24 @@ function classifyGoogleQuotaKind(snapshot: GoogleQuotaAccountSnapshot): {
 async function resolveGoogleQuotaAccess(
 	account: QuotaAccount,
 	auth: AuthStorageEntry,
+	signal?: AbortSignal,
 ): Promise<{ accessToken: string; projectId?: string }> {
 	const projectId = getGoogleProjectId(account, auth);
-	const hasFreshAccess = typeof auth.access === "string"
-		&& auth.access.length > 0
+	const accessToken = typeof auth.access === "string" && auth.access.length > 0
+		? auth.access
+		: undefined;
+	const hasFreshAccess = accessToken !== undefined
 		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
 	if (hasFreshAccess) {
-		return { accessToken: auth.access, projectId };
+		return { accessToken, projectId };
 	}
 
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		const credentials = account.baseProvider === "google-gemini-cli"
-			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
-			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
+		const credentials = await refreshOAuth(
+			account.baseProvider,
+			auth as OAuthCredentials,
+			signal,
+		);
 		return {
 			accessToken: credentials.access,
 			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
@@ -1186,8 +1207,8 @@ async function resolveGoogleQuotaAccess(
 		};
 	}
 
-	if (typeof auth.access === "string" && auth.access.length > 0) {
-		return { accessToken: auth.access, projectId };
+	if (accessToken !== undefined) {
+		return { accessToken, projectId };
 	}
 
 	throw new Error("Missing Google access token. Log in again.");
@@ -1358,7 +1379,7 @@ async function checkGoogleQuotaAccount(
 	let projectId: string | undefined;
 
 	try {
-		const credentials = await resolveGoogleQuotaAccess(account, auth);
+		const credentials = await resolveGoogleQuotaAccess(account, auth, signal);
 		projectId = credentials.projectId;
 		const snapshot = await fetchSnapshot(credentials.accessToken, credentials.projectId, signal);
 		if (snapshot.models.length === 0 || snapshot.worstRemainingPercent === undefined) {
@@ -1422,12 +1443,12 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 			providerName,
 			baseProvider: getBaseProvider(providerName) || providerName,
 			displayName,
-			auth: authStorageOf(ctx).get(providerName) as AuthStorageEntry | undefined,
+			auth: getAuthStorage(ctx).get(providerName),
 		});
 	};
 
 	for (const checker of PROVIDER_QUOTA_CHECKERS) {
-		if (authStorageOf(ctx).hasAuth(checker.baseProvider)) {
+		if (getAuthStorage(ctx).hasAuth(checker.baseProvider)) {
 			pushAccount(
 				checker.baseProvider,
 				PROVIDER_TEMPLATES[checker.baseProvider]?.displayName || checker.baseProvider,
@@ -1947,7 +1968,7 @@ function getProjectScopedProviderNames(
 	}
 
 	for (const providerName of SUPPORTED_PROVIDERS) {
-		if (authStorageOf(ctx).hasAuth(providerName)) {
+		if (getAuthStorage(ctx).hasAuth(providerName)) {
 			push(providerName);
 		}
 	}
@@ -1962,7 +1983,7 @@ function findSelectableModelForProvider(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!authStorageOf(ctx).hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -2703,7 +2724,7 @@ class PoolManager {
 				const best = await this.getQuotaBestMember(
 					pool,
 					currentModel.provider,
-					authStorageOf(ctx),
+					getAuthStorage(ctx),
 					cascade.attemptedProviders,
 				);
 				if (best) {
@@ -2866,7 +2887,7 @@ class PoolManager {
 		const plan = this.buildFailoverPlan(
 			currentModel,
 			config,
-			authStorageOf(ctx),
+			getAuthStorage(ctx),
 			{
 				attemptedProviders: cascade.attemptedProviders,
 				visitedChainIndexes: cascade.visitedChainIndexes,
@@ -2999,7 +3020,7 @@ function getSwitchableProviderOptions(
 	const seen = new Set<string>();
 	const push = (providerName: string, label: string, description: string) => {
 		if (allowed && !allowed.has(providerName)) return;
-		if (!authStorageOf(ctx).hasAuth(providerName)) return;
+		if (!getAuthStorage(ctx).hasAuth(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		options.push({ providerName, label, description });
@@ -3023,7 +3044,7 @@ function resolveSwitchTargetModel(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!authStorageOf(ctx).hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -3139,8 +3160,8 @@ async function removeSubscriptionEntry(
 	if (!confirmed) return;
 
 	const name = subProviderName(entry);
-	if (authStorageOf(ctx).hasAuth(name)) {
-		await authStorageOf(ctx).logout(name);
+	if (getAuthStorage(ctx).hasAuth(name)) {
+		await getAuthStorage(ctx).logout(name);
 	}
 	pi.unregisterProvider(name);
 
@@ -3180,7 +3201,7 @@ async function showSubscriptionActions(
 			items: [
 				{
 					value: subProviderName(entry),
-					label: formatSubscriptionListLine(entry, config, authStorageOf(ctx)),
+					label: formatSubscriptionListLine(entry, config, getAuthStorage(ctx)),
 				},
 			],
 			confirmHint: "back",
@@ -3190,7 +3211,7 @@ async function showSubscriptionActions(
 	}
 
 	const name = subProviderName(entry);
-	const hasAuth = authStorageOf(ctx).hasAuth(name);
+	const hasAuth = getAuthStorage(ctx).hasAuth(name);
 	const actionItems: SelectItem[] = [
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		hasAuth
@@ -3219,7 +3240,7 @@ async function showSubscriptionActions(
 		return;
 	}
 	if (action === "logout") {
-		await authStorageOf(ctx).logout(name);
+		await getAuthStorage(ctx).logout(name);
 		await ctx.modelRegistry.refresh();
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
@@ -3252,7 +3273,7 @@ async function handleSubsList(
 			items: all.map((entry) => ({
 				value: subProviderName(entry),
 				label: subDisplayName(entry),
-				description: formatSubscriptionMeta(entry, config, authStorageOf(ctx)),
+				description: formatSubscriptionMeta(entry, config, getAuthStorage(ctx)),
 			})),
 			initialValue: preferredProviderName,
 			confirmHint: "open",
@@ -3343,7 +3364,7 @@ async function handleSubsRemove(
 		items: config.subscriptions.map((entry) => ({
 			value: subProviderName(entry),
 			label: subDisplayName(entry),
-			description: authStorageOf(ctx).hasAuth(subProviderName(entry))
+			description: getAuthStorage(ctx).hasAuth(subProviderName(entry))
 				? "logged in"
 				: "not logged in",
 		})),
@@ -3366,7 +3387,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const notLoggedIn = all.filter(
-		(entry) => !authStorageOf(ctx).hasAuth(subProviderName(entry)),
+		(entry) => !getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (notLoggedIn.length === 0) {
@@ -3408,7 +3429,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const loggedIn = all.filter((entry) =>
-		authStorageOf(ctx).hasAuth(subProviderName(entry)),
+		getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (loggedIn.length === 0) {
@@ -3433,7 +3454,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = loggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	await authStorageOf(ctx).logout(subProviderName(entry));
+	await getAuthStorage(ctx).logout(subProviderName(entry));
 	await ctx.modelRegistry.refresh();
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
@@ -3451,14 +3472,17 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const lines: string[] = [];
 	for (const entry of all) {
 		const name = subProviderName(entry);
-		const cred = authStorageOf(ctx).get(name);
-		const hasAuth = authStorageOf(ctx).hasAuth(name);
+		const authStorage = getAuthStorage(ctx);
+		const cred = authStorage.get(name);
+		const hasAuth = authStorage.hasAuth(name);
 
 		let status: string;
 		if (!hasAuth) {
 			status = "not logged in";
 		} else if (cred?.type === "oauth") {
-			const expiresIn = cred.expires - Date.now();
+			const expiresIn = typeof cred.expires === "number"
+				? cred.expires - Date.now()
+				: 0;
 			if (expiresIn > 0) {
 				const mins = Math.round(expiresIn / 60000);
 				status = `logged in (expires ${mins}m)`;
@@ -3717,14 +3741,14 @@ async function editPoolMembers(
 		const removableItems: SelectItem[] = selectedMembers.map((member) => ({
 			value: `remove:${member}`,
 			label: `remove ${member}`,
-			description: authStorageOf(ctx).hasAuth(member) ? "logged in" : "not logged in",
+			description: getAuthStorage(ctx).hasAuth(member) ? "logged in" : "not logged in",
 		}));
 		const addableItems: SelectItem[] = availableProviders
 			.filter((providerName) => !selectedMembers.includes(providerName))
 			.map((providerName) => ({
 				value: `add:${providerName}`,
 				label: `add ${providerName}`,
-				description: authStorageOf(ctx).hasAuth(providerName)
+				description: getAuthStorage(ctx).hasAuth(providerName)
 					? "logged in"
 					: "not logged in",
 			}));
@@ -3812,7 +3836,7 @@ async function promptForPoolDefinition(
 
 	const allProviders = getAllProvidersForBase(baseProvider, allSubs);
 	const authedProviders = allProviders.filter((p) =>
-		authStorageOf(ctx).hasAuth(p),
+		getAuthStorage(ctx).hasAuth(p),
 	);
 
 	if (authedProviders.length === 0) {
@@ -3832,7 +3856,7 @@ async function promptForPoolDefinition(
 		const optionsList = [
 			`--- Selected (${members.length}): ${members.join(", ") || "none"} ---`,
 			...remaining.map((p) => {
-				const authed = authStorageOf(ctx).hasAuth(p);
+				const authed = getAuthStorage(ctx).hasAuth(p);
 				return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
 			}),
 			"[Done - create pool]",
@@ -3941,7 +3965,7 @@ async function promptForPoolDefinition(
 		memberSchedule,
 		selectorScript,
 	});
-	if (!built.ok) {
+	if (built.ok === false) {
 		ctx.ui.notify(built.error, "warning");
 		return undefined;
 	}
@@ -4061,7 +4085,7 @@ async function inspectPoolConfig(
 	await showWrappedSelect(ctx, {
 		title: `Pool Status: ${pool.name}`,
 		subtitle: "Press Enter or Escape to go back to the pools list.",
-		items: formatPoolStatusLines(pool, authStorageOf(ctx), poolManager)
+		items: formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager)
 			.map((line, index) => ({ value: `${index}:${line}`, label: line })),
 		confirmHint: "back",
 		cancelHint: "back",
@@ -4306,7 +4330,7 @@ async function handlePoolList(
 			items: pools.map((pool) => ({
 				value: pool.name,
 				label: pool.name,
-				description: formatPoolListDescription(pool, authStorageOf(ctx), poolManager),
+				description: formatPoolListDescription(pool, getAuthStorage(ctx), poolManager),
 			})),
 			initialValue: preferredPoolName,
 			confirmHint: "open",
@@ -4484,7 +4508,7 @@ async function handlePoolStatus(
 	const lines: string[] = [];
 	for (const pool of config.pools) {
 		lines.push(
-			...formatPoolStatusLines(pool, authStorageOf(ctx), poolManager),
+			...formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager),
 		);
 	}
 
@@ -4851,7 +4875,7 @@ async function handlePoolChainCreate(
 		entries,
 		enabled: true,
 	});
-	if (!built.ok) {
+	if (built.ok === false) {
 		ctx.ui.notify(built.error, "warning");
 		return;
 	}
@@ -4877,7 +4901,7 @@ async function handlePoolChainList(
 	await ctx.ui.select(
 		"Chains",
 		config.chains.map((chain) =>
-			formatChainListLine(chain, config, authStorageOf(ctx), poolManager),
+			formatChainListLine(chain, config, getAuthStorage(ctx), poolManager),
 		),
 	);
 }
@@ -4957,7 +4981,7 @@ async function handlePoolChainStatus(
 
 	await ctx.ui.select(
 		`Chain Status: ${chain.name}`,
-		formatChainStatusLines(chain, config, authStorageOf(ctx), poolManager),
+		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager),
 	);
 }
 
@@ -5045,7 +5069,7 @@ async function handlePoolProject(
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
 			...SUPPORTED_PROVIDERS.filter((p) =>
-				authStorageOf(ctx).hasAuth(p),
+				getAuthStorage(ctx).hasAuth(p),
 			),
 			...allSubs.map((s) => subProviderName(s)),
 		];
@@ -5066,7 +5090,7 @@ async function handlePoolProject(
 			const options = [
 				`--- Allowed (${allowed.length}): ${allowed.join(", ") || "all (no restriction)"} ---`,
 				...remaining.map((p) => {
-					const authed = authStorageOf(ctx).hasAuth(p);
+					const authed = getAuthStorage(ctx).hasAuth(p);
 					const current = currentAllowed.includes(p) ? " [currently allowed]" : "";
 					return `${p} ${authed ? "[logged in]" : "[not logged in]"}${current}`;
 				}),
@@ -5197,7 +5221,7 @@ async function handlePoolProject(
 		lines.push("");
 		lines.push(`Effective subs (${effective.subscriptions.length}):`);
 		for (const sub of effective.subscriptions) {
-			const authed = authStorageOf(ctx).hasAuth(subProviderName(sub));
+			const authed = getAuthStorage(ctx).hasAuth(subProviderName(sub));
 			lines.push(`  ${subDisplayName(sub)} -- ${authed ? "logged in" : "not logged in"}`);
 		}
 
@@ -5468,7 +5492,7 @@ async function handlePresetActivate(
 
 	for (const entry of preset.entries) {
 		if (!entry.enabled) continue;
-		if (!authStorageOf(ctx).hasAuth(entry.provider)) continue;
+		if (!getAuthStorage(ctx).hasAuth(entry.provider)) continue;
 		const model = ctx.modelRegistry.find(entry.provider, entry.model);
 		if (!model) continue;
 
@@ -5728,7 +5752,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			if (pool) {
 				const available = poolManager.getAvailableMembers(
 					pool,
-					authStorageOf(ctx),
+					getAuthStorage(ctx),
 				);
 				if (available.length === 0) {
 					ctx.ui.notify(
@@ -5816,7 +5840,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainMenu(ctx, poolManager);
 						case "list":
 						case "ls":
-							return handlePoolChainList(ctx);
+							return handlePoolChainList(ctx, poolManager);
 						case "toggle":
 							return handlePoolChainToggle(ctx);
 						case "remove":
@@ -5825,7 +5849,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainRemove(ctx);
 						case "status":
 						case "info":
-							return handlePoolChainStatus(ctx);
+							return handlePoolChainStatus(ctx, poolManager);
 						case "create":
 						case "new":
 							return handlePoolChainCreate(ctx, poolManager);
