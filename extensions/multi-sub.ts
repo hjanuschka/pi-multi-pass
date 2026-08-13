@@ -883,7 +883,7 @@ async function showWrappedSelect(
 ): Promise<string | undefined> {
 	if (options.items.length === 0) return undefined;
 
-	if (!ctx.hasUI) {
+	if (ctx.mode !== "tui") {
 		const renderedItems = options.items.map((item) =>
 			item.description ? `${item.label} — ${item.description}` : item.label,
 		);
@@ -982,7 +982,7 @@ async function loadQuotaResults(
 	ctx: ExtensionCommandContext,
 	accounts: QuotaAccount[],
 ): Promise<QuotaCheckResult[] | null> {
-	if (!ctx.hasUI) {
+	if (ctx.mode !== "tui") {
 		return runQuotaChecks(accounts);
 	}
 
