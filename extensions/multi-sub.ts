@@ -46,29 +46,14 @@ import {
 	getAgentDir,
 	keyHint,
 } from "@earendil-works/pi-coding-agent";
+import * as legacyOAuth from "@earendil-works/pi-ai/oauth";
 import {
-	anthropicOAuthProvider,
-	loginAnthropic,
-	refreshAnthropicToken,
-	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	githubCopilotOAuthProvider,
-	loginGitHubCopilot,
-	refreshGitHubCopilotToken,
-	getGitHubCopilotBaseUrl,
-	normalizeDomain,
-	geminiCliOAuthProvider,
-	loginGeminiCli,
-	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
+	getModels,
+	type Api,
+	type Model,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
-} from "@earendil-works/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai";
 import {
 	Container,
 	Key,
@@ -85,160 +70,317 @@ import {
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
+type NativeOAuthPrompt =
+	| { type: "text" | "secret" | "manual_code"; message: string; placeholder?: string }
+	| {
+			type: "select";
+			message: string;
+			options: readonly { id: string; label: string; description?: string }[];
+	  };
+
+type NativeOAuthEvent =
+	| { type: "auth_url"; url: string; instructions?: string }
+	| {
+			type: "device_code";
+			userCode: string;
+			verificationUri: string;
+			intervalSeconds?: number;
+			expiresInSeconds?: number;
+	  }
+	| { type: "progress" | "info"; message: string };
+
+interface NativeOAuthInteraction {
+	signal: AbortSignal;
+	prompt(prompt: NativeOAuthPrompt): Promise<string>;
+	notify(event: NativeOAuthEvent): void;
+}
+
+interface NativeOAuthProvider {
+	name: string;
+	isSubscription?: boolean;
+	login(interaction: NativeOAuthInteraction): Promise<OAuthCredentials>;
+	refresh(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials>;
+}
+
+interface NativeProvider {
+	id: string;
+	auth?: { oauth?: NativeOAuthProvider };
+}
+
+type LegacyOAuthModule = Record<string, unknown>;
+type LegacyOAuthFunction = (...args: any[]) => any;
+
+const legacyOAuthModule = legacyOAuth as unknown as LegacyOAuthModule;
+let nativeProvidersPromise: Promise<NativeProvider[]> | undefined;
+
+async function getNativeOAuth(providerId: string): Promise<NativeOAuthProvider | undefined> {
+	nativeProvidersPromise ??= (async () => {
+		const loaders = [
+			() => import("@earendil-works/pi-ai/providers/all"),
+			() => import("@mariozechner/pi-ai/providers/all"),
+		];
+		for (const load of loaders) {
+			try {
+				const module = (await load()) as {
+					builtinProviders?: () => NativeProvider[];
+				};
+				if (typeof module.builtinProviders !== "function") continue;
+				return module.builtinProviders();
+			} catch {
+				// Older pi-ai versions do not expose the provider catalog.
+			}
+		}
+		return [];
+	})();
+
+	const provider = (await nativeProvidersPromise).find((candidate) => candidate.id === providerId);
+	return provider?.auth?.oauth;
+}
+
+function getLegacyOAuthFunction<T extends LegacyOAuthFunction>(name: string): T {
+	const fn = legacyOAuthModule[name];
+	if (typeof fn !== "function") {
+		throw new Error(`OAuth flow ${name} is unavailable in this pi-ai version`);
+	}
+	return fn as T;
+}
+
+function toNativeOAuthInteraction(callbacks: OAuthLoginCallbacks): NativeOAuthInteraction {
+	const legacyCallbacks = callbacks as OAuthLoginCallbacks & {
+		onDeviceCode?: (info: {
+			userCode: string;
+			verificationUri: string;
+			intervalSeconds?: number;
+			expiresInSeconds?: number;
+		}) => void;
+		onSelect?: (prompt: {
+			message: string;
+			options: { id: string; label: string }[];
+		}) => Promise<string | undefined>;
+	};
+	const signal = callbacks.signal ?? new AbortController().signal;
+
+	return {
+		signal,
+		async prompt(prompt: NativeOAuthPrompt): Promise<string> {
+			if (prompt.type === "select") {
+				if (legacyCallbacks.onSelect) {
+					const selected = await legacyCallbacks.onSelect({
+						message: prompt.message,
+						options: prompt.options.map(({ id, label }) => ({ id, label })),
+					});
+					if (selected === undefined) throw new Error("Login cancelled");
+					return selected;
+				}
+				const options = prompt.options.map((option) => option.label).join(", ");
+				return callbacks.onPrompt({ message: `${prompt.message} (${options})` });
+			}
+			if (prompt.type === "manual_code" && callbacks.onManualCodeInput) {
+				return callbacks.onManualCodeInput();
+			}
+			return callbacks.onPrompt({ message: prompt.message, placeholder: prompt.placeholder });
+		},
+		notify(event: NativeOAuthEvent): void {
+			switch (event.type) {
+				case "auth_url":
+					callbacks.onAuth({ url: event.url, instructions: event.instructions });
+					break;
+				case "device_code":
+					if (legacyCallbacks.onDeviceCode) legacyCallbacks.onDeviceCode(event);
+					else callbacks.onProgress?.(`Open ${event.verificationUri} and enter ${event.userCode}`);
+					break;
+				case "progress":
+				case "info":
+					callbacks.onProgress?.(event.message);
+					break;
+			}
+		},
+	};
+}
+
+async function loginWithLegacyOAuth(
+	providerId: string,
+	callbacks: OAuthLoginCallbacks,
+): Promise<OAuthCredentials> {
+	switch (providerId) {
+		case "anthropic":
+			return getLegacyOAuthFunction<any>("loginAnthropic")({
+				onAuth: callbacks.onAuth,
+				onPrompt: callbacks.onPrompt,
+				onProgress: callbacks.onProgress,
+				onManualCodeInput: callbacks.onManualCodeInput,
+				signal: callbacks.signal,
+			});
+		case "openai-codex":
+			return getLegacyOAuthFunction<any>("loginOpenAICodex")({
+				onAuth: callbacks.onAuth,
+				onPrompt: callbacks.onPrompt,
+				onProgress: callbacks.onProgress,
+				onManualCodeInput: callbacks.onManualCodeInput,
+				signal: callbacks.signal,
+			});
+		case "github-copilot":
+			return getLegacyOAuthFunction<any>("loginGitHubCopilot")({
+				onAuth: (url: string, instructions?: string) => callbacks.onAuth({ url, instructions }),
+				onPrompt: callbacks.onPrompt,
+				onProgress: callbacks.onProgress,
+				signal: callbacks.signal,
+			});
+		case "google-gemini-cli":
+			return getLegacyOAuthFunction<any>("loginGeminiCli")(
+				callbacks.onAuth,
+				callbacks.onProgress,
+				callbacks.onManualCodeInput,
+			);
+		case "google-antigravity":
+			return getLegacyOAuthFunction<any>("loginAntigravity")(
+				callbacks.onAuth,
+				callbacks.onProgress,
+				callbacks.onManualCodeInput,
+			);
+		default:
+			throw new Error(`Unsupported OAuth provider: ${providerId}`);
+	}
+}
+
+async function refreshWithLegacyOAuth(
+	providerId: string,
+	credentials: OAuthCredentials,
+): Promise<OAuthCredentials> {
+	switch (providerId) {
+		case "anthropic":
+			return getLegacyOAuthFunction<any>("refreshAnthropicToken")(credentials.refresh);
+		case "openai-codex":
+			return getLegacyOAuthFunction<any>("refreshOpenAICodexToken")(credentials.refresh);
+		case "github-copilot": {
+			const creds = credentials as CopilotCredentials;
+			return getLegacyOAuthFunction<any>("refreshGitHubCopilotToken")(creds.refresh, creds.enterpriseUrl);
+		}
+		case "google-gemini-cli": {
+			const creds = credentials as GeminiCredentials;
+			if (!creds.projectId) throw new Error("Missing projectId");
+			return getLegacyOAuthFunction<any>("refreshGoogleCloudToken")(creds.refresh, creds.projectId);
+		}
+		case "google-antigravity": {
+			const creds = credentials as GeminiCredentials;
+			if (!creds.projectId) throw new Error("Missing projectId");
+			return getLegacyOAuthFunction<any>("refreshAntigravityToken")(creds.refresh, creds.projectId);
+		}
+		default:
+			throw new Error(`Unsupported OAuth provider: ${providerId}`);
+	}
+}
+
+function buildOAuthAdapter(
+	providerId: string,
+	name: string,
+	usesCallbackServer = false,
+	getApiKey: (credentials: OAuthCredentials) => string = (credentials) => credentials.access,
+): MultiPassOAuth {
+	return {
+		name,
+		isSubscription: true,
+		...(usesCallbackServer ? { usesCallbackServer: true } : {}),
+		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+			const native = await getNativeOAuth(providerId);
+			return native ? native.login(toNativeOAuthInteraction(callbacks)) : loginWithLegacyOAuth(providerId, callbacks);
+		},
+		async refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials> {
+			const native = await getNativeOAuth(providerId);
+			return native ? native.refresh(credentials, signal) : refreshWithLegacyOAuth(providerId, credentials);
+		},
+		getApiKey,
+	};
+}
+
+function normalizeDomain(input: string): string | null {
+	const trimmed = input.trim();
+	if (!trimmed) return null;
+	try {
+		const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
+		return url.hostname;
+	} catch {
+		return null;
+	}
+}
+
+function getGitHubCopilotBaseUrl(token?: string, enterpriseDomain?: string): string {
+	const match = token?.match(/proxy-ep=([^;]+)/);
+	if (match?.[1]) return `https://${match[1].replace(/^proxy\./, "api.")}`;
+	if (enterpriseDomain) return `https://copilot-api.${enterpriseDomain}`;
+	return "https://api.individual.githubcopilot.com";
+}
+
+interface MultiPassOAuth {
+	name: string;
+	isSubscription?: boolean;
+	usesCallbackServer?: boolean;
+	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+	refreshToken(credentials: OAuthCredentials, signal: AbortSignal): Promise<OAuthCredentials>;
+	getApiKey(credentials: OAuthCredentials): string;
+	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
+}
+
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
 	usesCallbackServer?: boolean;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
-	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+	buildOAuth(index: number): MultiPassOAuth;
+	buildModifyModels?(providerName: string): MultiPassOAuth["modifyModels"];
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `Anthropic #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAnthropic({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshAnthropicToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildOAuthAdapter("anthropic", `Anthropic #${index}`);
 		},
 	},
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `ChatGPT Codex #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginOpenAICodex({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshOpenAICodexToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildOAuthAdapter("openai-codex", `ChatGPT Codex #${index}`, true);
 		},
 	},
 
 	"github-copilot": {
 		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `GitHub Copilot #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGitHubCopilot({
-						onAuth: (url: string, instructions?: string) =>
-							callbacks.onAuth({ url, instructions }),
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						signal: callbacks.signal,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as CopilotCredentials;
-					return refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildOAuthAdapter("github-copilot", `GitHub Copilot #${index}`);
 		},
 		buildModifyModels(providerName: string) {
 			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
 				const creds = credentials as CopilotCredentials;
-				const domain = creds.enterpriseUrl
-					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
-					: undefined;
+				const domain = creds.enterpriseUrl ? (normalizeDomain(creds.enterpriseUrl) ?? undefined) : undefined;
 				const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
-				return models.map((m) =>
-					m.provider === providerName ? { ...m, baseUrl } : m,
-				);
+				return models.map((m) => m.provider === providerName ? { ...m, baseUrl } : m);
 			};
 		},
 	},
 
 	"google-gemini-cli": {
 		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `Google Cloud Code Assist #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGeminiCli(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshGoogleCloudToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
+			return buildOAuthAdapter("google-gemini-cli", `Google Cloud Code Assist #${index}`, true, (credentials) => {
+				const creds = credentials as GeminiCredentials;
+				return JSON.stringify({ token: creds.access, projectId: creds.projectId });
+			});
 		},
 	},
 
 	"google-antigravity": {
 		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `Antigravity #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshAntigravityToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
+			return buildOAuthAdapter("google-antigravity", `Antigravity #${index}`, true, (credentials) => {
+				const creds = credentials as GeminiCredentials;
+				return JSON.stringify({ token: creds.access, projectId: creds.projectId });
+			});
 		},
 	},
 };
-
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 
 // ==========================================================================
