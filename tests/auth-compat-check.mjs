@@ -48,6 +48,23 @@ assert.equal(
 	false,
 	'getModels must come from "@earendil-works/pi-ai/compat" in pi 0.84.4',
 );
+assert.equal(
+	/Use \/login and select/.test(code),
+	false,
+	"subscription login actions must start OAuth directly, not send the user to /login",
+);
+// Failover replays the prompt while the failed turn is still streaming. pi
+// 0.84.4 throws "Agent is already processing" unless the call declares how to
+// queue itself, so every replay site must pass deliverAs.
+const sendCalls = code.match(/sendUserMessage\([^;]*?\)/g) ?? [];
+assert.ok(sendCalls.length > 0, "expected at least one sendUserMessage call site");
+for (const call of sendCalls) {
+	assert.match(
+		call,
+		/deliverAs:\s*"followUp"/,
+		`sendUserMessage must queue the failover replay: ${call.replace(/\s+/g, " ")}`,
+	);
+}
 
 // --- behavioural: drive the real shim -------------------------------------
 const agentDir = mkdtempSync(join(tmpdir(), "multipass-authcompat-"));
@@ -104,6 +121,19 @@ assert.ok(cred && typeof cred.then !== "function", "get must be synchronous, not
 assert.equal(cred.type, "oauth");
 assert.equal(cred.access, "a-tok", "get must return the raw stored credential");
 assert.equal(auth.get("nope"), undefined);
+
+// set persists the raw OAuth credential under the selected cloned provider,
+// preserving every other provider, then refreshes exactly that provider.
+auth.set("anthropic-2", {
+	type: "oauth",
+	access: "new-a-tok",
+	refresh: "new-a-ref",
+	expires: Date.now() + 7200_000,
+});
+const afterSet = JSON.parse(readFileSync(authPath, "utf-8"));
+assert.equal(afterSet["anthropic-2"].access, "new-a-tok");
+assert.equal(afterSet.anthropic.access, "a-tok", "set must preserve other providers");
+assert.deepEqual(refreshCalls.at(-1), { providers: ["anthropic-2"] }, "set must refresh that provider");
 
 // logout removes exactly one provider and asks the registry to refresh it.
 auth.logout("anthropic-2");

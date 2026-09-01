@@ -45,6 +45,7 @@ import {
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
+	LoginDialogComponent,
 	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
@@ -303,6 +304,7 @@ interface AuthStorageEntry {
 interface AuthCompat {
 	hasAuth(provider: string): boolean;
 	get(provider: string): AuthStorageEntry | undefined;
+	set(provider: string, credential: AuthStorageEntry): void;
 	logout(provider: string): void;
 }
 
@@ -332,6 +334,12 @@ function createAuthCompat(modelRegistry: ExtensionContext["modelRegistry"]): Aut
 		get(provider: string): AuthStorageEntry | undefined {
 			return readStoredCredential(provider) as AuthStorageEntry | undefined;
 		},
+		set(provider: string, credential: AuthStorageEntry): void {
+			const data = readAuthJson();
+			data[provider] = credential;
+			writeFileSync(authJsonPath(), JSON.stringify(data, null, 2), { mode: 0o600 });
+			void modelRegistry.refresh({ providers: [provider] });
+		},
 		logout(provider: string): void {
 			const data = readAuthJson();
 			if (!(provider in data)) return;
@@ -349,6 +357,87 @@ function createAuthCompat(modelRegistry: ExtensionContext["modelRegistry"]): Aut
 function ctxAuth(ctx: ExtensionContext | ExtensionCommandContext): AuthCompat {
 	rememberRegistry(ctx);
 	return createAuthCompat(ctx.modelRegistry);
+}
+
+type SubscriptionLoginResult =
+	| { ok: true }
+	| { ok: false; cancelled: boolean; error?: string };
+
+function loginWasCancelled(error: unknown): boolean {
+	return error instanceof Error && (error.message === "Login cancelled" || error.name === "AbortError");
+}
+
+/** Start and persist the selected cloned provider's OAuth flow directly. */
+async function loginSubscription(ctx: ExtensionCommandContext, entry: SubEntry): Promise<boolean> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify("Subscription login requires interactive UI.", "error");
+		return false;
+	}
+
+	rememberRegistry(ctx);
+	const providerName = subProviderName(entry);
+	const displayName = subDisplayName(entry);
+	const oauth = PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index);
+	if (!oauth) {
+		ctx.ui.notify(`No OAuth flow is available for ${displayName}.`, "error");
+		return false;
+	}
+
+	const result = await ctx.ui.custom<SubscriptionLoginResult>((tui, _theme, _keybindings, done) => {
+		let finished = false;
+		const finish = (value: SubscriptionLoginResult): void => {
+			if (finished) return;
+			finished = true;
+			done(value);
+		};
+
+		const dialog = new LoginDialogComponent(
+			tui,
+			providerName,
+			(_success, message) => finish({ ok: false, cancelled: true, error: message }),
+			displayName,
+		);
+
+		void (async () => {
+			try {
+				const credential = await oauth.login({
+					onAuth: (info) => dialog.showAuth(info.url, info.instructions),
+					onDeviceCode: (info) => {
+						dialog.showDeviceCode(info);
+						dialog.showWaiting("Waiting for authentication...");
+					},
+					onPrompt: (prompt) => dialog.showPrompt(prompt.message, prompt.placeholder),
+					onProgress: (message) => dialog.showProgress(message),
+					onManualCodeInput: () => dialog.showManualInput("Paste the authorization code"),
+					onSelect: async (prompt) => {
+						const labels = prompt.options.map((option) => option.label);
+						const selected = await ctx.ui.select(prompt.message, labels);
+						return prompt.options.find((option) => option.label === selected)?.id;
+					},
+					signal: dialog.signal,
+				});
+				ctxAuth(ctx).set(providerName, { ...credential, type: "oauth" });
+				finish({ ok: true });
+			} catch (error) {
+				finish({
+					ok: false,
+					cancelled: loginWasCancelled(error) || dialog.signal.aborted,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		})();
+
+		return dialog;
+	});
+
+	if (result.ok) {
+		ctx.ui.notify(`Logged in to ${displayName}`, "info");
+		return true;
+	}
+	if (!result.cancelled) {
+		ctx.ui.notify(`Login failed for ${displayName}: ${result.error ?? "Unknown error"}`, "error");
+	}
+	return false;
 }
 
 interface QuotaAccount {
@@ -2789,7 +2878,14 @@ class PoolManager {
 
 		if (lastUserPrompt) {
 			this.suppressNextStartTurn = true;
-			this.pi.sendUserMessage(lastUserPrompt);
+			// Failover runs while the failed turn is still streaming, so the replay
+			// must declare how to queue itself. Without deliverAs, pi 0.84.4 throws
+			// "Agent is already processing. Specify streamingBehavior ('steer' or
+			// 'followUp') to queue the message." and the rotation notification is
+			// immediately followed by an extension error. "followUp" (not "steer")
+			// because the replay must be a new turn on the new provider, not an
+			// injection into the turn that just failed. Ignored when not streaming.
+			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
 		}
 
 		return true;
@@ -3068,10 +3164,7 @@ async function showSubscriptionActions(
 		return renameSubscriptionLabel(ctx, config, entry);
 	}
 	if (action === "login") {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		await loginSubscription(ctx, entry);
 		return;
 	}
 	if (action === "logout") {
@@ -3172,10 +3265,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext): Pr
 	);
 
 	if (loginNow) {
-		ctx.ui.notify(
-			`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-			"info",
-		);
+		await loginSubscription(ctx, entry);
 	} else {
 		ctx.ui.notify(`Added ${subDisplayName(entry)}. Use /subs login to authenticate.`, "info");
 	}
@@ -3237,7 +3327,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 
 	const selectedProviderName = await showWrappedSelect(ctx, {
 		title: "Login to subscription",
-		subtitle: "Select a subscription to see login instructions.",
+		subtitle: "Select a subscription to start its OAuth login.",
 		initialValue: ctx.model?.provider,
 		items: notLoggedIn.map((entry) => ({
 			value: subProviderName(entry),
@@ -3252,10 +3342,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.ui.notify(
-		`Use /login and select "${PROVIDER_TEMPLATES[entry.provider]?.buildOAuth(entry.index).name}" to authenticate.`,
-		"info",
-	);
+	await loginSubscription(ctx, entry);
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
