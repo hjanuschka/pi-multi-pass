@@ -3147,7 +3147,7 @@ async function showSubscriptionActions(
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		hasAuth
 			? { value: "logout", label: "logout", description: "Log out this subscription" }
-			: { value: "login", label: "login", description: "Show login instructions" },
+			: { value: "login", label: "login", description: "Start the OAuth login for this subscription" },
 		{ value: "remove", label: "remove", description: "Remove this subscription" },
 	];
 
@@ -3464,21 +3464,36 @@ function createPoolValidationMessage(members: string[]): string | null {
 	return null;
 }
 
+const SCHEDULE_WINDOW_FORMAT_HINT =
+	'hours "9-17" or "09:00-17:00", days "mon-fri" or "sat", dates "2026-01-01..2026-01-31"';
+
 /** Parse a human-friendly schedule window like "9-17 mon-fri" or "22-6". */
 function parseScheduleWindowInput(raw: string): ScheduleWindow | null {
 	const window: ScheduleWindow = {};
 	const parts = raw.trim().split(/\s+/);
 
 	for (const part of parts) {
-		// Hour range: "9-17" or "22-6"
-		const hourMatch = part.match(/^(\d{1,2})-(\d{1,2})$/);
+		// Hour range: "9-17", "22-6", or clock form "09:00-17:00".
+		// ScheduleWindow.hours holds whole hours only, so a clock form with
+		// non-zero minutes is rejected rather than silently truncated.
+		const hourMatch = part.match(/^(\d{1,2})(?::(\d{2}))?-(\d{1,2})(?::(\d{2}))?$/);
 		if (hourMatch) {
 			const start = parseInt(hourMatch[1], 10);
-			const end = parseInt(hourMatch[2], 10);
-			if (start >= 0 && start <= 23 && end >= 0 && end <= 23) {
+			const end = parseInt(hourMatch[3], 10);
+			const startMinutes = hourMatch[2] ? parseInt(hourMatch[2], 10) : 0;
+			const endMinutes = hourMatch[4] ? parseInt(hourMatch[4], 10) : 0;
+			if (
+				startMinutes === 0 &&
+				endMinutes === 0 &&
+				start >= 0 &&
+				start <= 23 &&
+				end >= 0 &&
+				end <= 23
+			) {
 				window.hours = [start, end];
 				continue;
 			}
+			return null;
 		}
 		// Day range: "mon-fri" or single day: "mon"
 		const dayRangeMatch = part.match(/^([a-z]{3})-([a-z]{3})$/);
@@ -3514,6 +3529,53 @@ function parseScheduleWindowInput(raw: string): ScheduleWindow | null {
 
 	if (!window.hours && !window.days && !window.dateRange) return null;
 	return window;
+}
+
+/**
+ * Prompt for a "preferred" member's time window and build its schedule.
+ *
+ * Unparseable input used to be discarded in silence, which is worse than it
+ * sounds: a member with role "preferred" and zero windows is treated as ALWAYS
+ * active (getScheduledMemberState), so typing "09:00-18:00" in the wrong format
+ * produced a pool that looked scheduled and behaved unscheduled. Now the input
+ * is either understood, or the user is told it was not.
+ */
+async function promptPreferredMemberSchedule(
+	ctx: ExtensionCommandContext,
+	member: string,
+): Promise<MemberSchedule> {
+	const windowDef = await ctx.ui.input(
+		`Time window for ${member}`,
+		`${SCHEDULE_WINDOW_FORMAT_HINT} (empty = always active)`,
+	);
+	const schedule: MemberSchedule = { role: "preferred", windows: [] };
+	const raw = windowDef?.trim();
+	if (!raw) return schedule;
+
+	const window = parseScheduleWindowInput(raw);
+	if (window) {
+		schedule.windows = [window];
+		return schedule;
+	}
+
+	ctx.ui.notify(
+		`Could not read "${raw}" as a time window, so ${member} stays always active. Accepted: ${SCHEDULE_WINDOW_FORMAT_HINT}.`,
+		"warning",
+	);
+	return schedule;
+}
+
+/**
+ * Staged "allowed subs" list for the project restriction editor.
+ *
+ * Seeded from the saved config on purpose: the editor exits into its save path
+ * on both [Done - save] and Escape, so starting from an empty list meant merely
+ * opening the screen and backing out wiped an existing restriction and reported
+ * "Project restriction cleared".
+ */
+function initialAllowedSubs(projectConf: ProjectConfig | undefined, allProviderNames: string[]): string[] {
+	const saved = projectConf?.allowedSubs ?? [];
+	return saved.filter((provider) => allProviderNames.includes(provider));
 }
 
 function buildPoolConfig(input: {
@@ -3837,16 +3899,7 @@ async function promptForPoolDefinition(
 			else if (rolePick.startsWith("overflow")) role = "overflow";
 
 			if (role === "preferred") {
-				const windowDef = await ctx.ui.input(
-					`Time window for ${member}`,
-					"hours e.g. 9-17, days e.g. mon-fri (or leave empty for always)",
-				);
-				const schedule: MemberSchedule = { role, windows: [] };
-				if (windowDef?.trim()) {
-					const window = parseScheduleWindowInput(windowDef.trim());
-					if (window) schedule.windows = [window];
-				}
-				memberSchedule[member] = schedule;
+				memberSchedule[member] = await promptPreferredMemberSchedule(ctx, member);
 			} else if (role === "overflow") {
 				memberSchedule[member] = { role };
 			}
@@ -4094,16 +4147,7 @@ async function changePoolStrategy(
 			else if (rolePick.startsWith("overflow")) role = "overflow";
 
 			if (role === "preferred") {
-				const windowDef = await ctx.ui.input(
-					`Time window for ${member}`,
-					"e.g. 9-17 mon-fri",
-				);
-				const schedule: MemberSchedule = { role, windows: [] };
-				if (windowDef?.trim()) {
-					const window = parseScheduleWindowInput(windowDef.trim());
-					if (window) schedule.windows = [window];
-				}
-				memberSchedule[member] = schedule;
+				memberSchedule[member] = await promptPreferredMemberSchedule(ctx, member);
 			} else if (role === "overflow") {
 				memberSchedule[member] = { role };
 			}
@@ -4999,7 +5043,7 @@ async function handlePoolProject(
 		}
 
 		const currentAllowed = projectConf?.allowedSubs || [];
-		const allowed: string[] = [];
+		const allowed: string[] = initialAllowedSubs(projectConf, allProviderNames);
 		let selecting = true;
 
 		while (selecting) {
@@ -5848,4 +5892,10 @@ export default function multiSub(pi: ExtensionAPI) {
 }
 
 /** Internal surface exposed for tests/auth-compat-check.mjs only. */
-export const __testHooks = { createAuthCompat, buildOAuthFromBuiltin, toAuthInteraction };
+export const __testHooks = {
+	createAuthCompat,
+	buildOAuthFromBuiltin,
+	toAuthInteraction,
+	parseScheduleWindowInput,
+	initialAllowedSubs,
+};
