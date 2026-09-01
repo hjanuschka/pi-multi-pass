@@ -2298,7 +2298,6 @@ class PoolManager {
 	private providerToPool: Map<string, string> = new Map();
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
-	private suppressNextStartTurn = false;
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
@@ -2749,10 +2748,6 @@ class PoolManager {
 	}
 
 	startTurn(prompt: string | null, currentModel?: Model<Api>): void {
-		if (this.suppressNextStartTurn) {
-			this.suppressNextStartTurn = false;
-			return;
-		}
 		if (!prompt) {
 			this.cascadeState = null;
 			return;
@@ -2875,18 +2870,6 @@ class PoolManager {
 			"info",
 		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-
-		if (lastUserPrompt) {
-			this.suppressNextStartTurn = true;
-			// Failover runs while the failed turn is still streaming, so the replay
-			// must declare how to queue itself. Without deliverAs, pi 0.84.4 throws
-			// "Agent is already processing. Specify streamingBehavior ('steer' or
-			// 'followUp') to queue the message." and the rotation notification is
-			// immediately followed by an extension error. "followUp" (not "steer")
-			// because the replay must be a new turn on the new provider, not an
-			// injection into the turn that just failed. Ignored when not streaming.
-			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
-		}
 
 		return true;
 	}
@@ -5685,7 +5668,9 @@ export default function multiSub(pi: ExtensionAPI) {
 		poolManager.startTurn(event.prompt, ctx.model);
 	});
 
-	// Listen for errors to trigger pool rotation
+	// agent_end is emitted before pi 0.84.4's automatic retry settles. Rotate
+	// only: AgentSession retries the same turn with agent.continue(). Enqueuing
+	// lastUserPrompt here would create one duplicate follow-up per failed account.
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
 		if (!event.messages || event.messages.length === 0) return;
 

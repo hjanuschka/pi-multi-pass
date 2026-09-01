@@ -53,19 +53,6 @@ assert.equal(
 	false,
 	"subscription login actions must start OAuth directly, not send the user to /login",
 );
-// Failover replays the prompt while the failed turn is still streaming. pi
-// 0.84.4 throws "Agent is already processing" unless the call declares how to
-// queue itself, so every replay site must pass deliverAs.
-const sendCalls = code.match(/sendUserMessage\([^;]*?\)/g) ?? [];
-assert.ok(sendCalls.length > 0, "expected at least one sendUserMessage call site");
-for (const call of sendCalls) {
-	assert.match(
-		call,
-		/deliverAs:\s*"followUp"/,
-		`sendUserMessage must queue the failover replay: ${call.replace(/\s+/g, " ")}`,
-	);
-}
-
 // --- behavioural: drive the real shim -------------------------------------
 const agentDir = mkdtempSync(join(tmpdir(), "multipass-authcompat-"));
 const authPath = join(agentDir, "auth.json");

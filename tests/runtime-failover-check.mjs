@@ -111,7 +111,6 @@ class RuntimeHarness {
     this.sentPrompts = [];
     this.setModelCalls = [];
     this.cascadeState = null;
-    this.suppressNextStartTurn = false;
 
     for (const pool of config.pools) {
       if (!pool.enabled) continue;
@@ -143,10 +142,6 @@ class RuntimeHarness {
   }
 
   startTurn(prompt, currentModel) {
-    if (this.suppressNextStartTurn) {
-      this.suppressNextStartTurn = false;
-      return;
-    }
     if (!prompt) {
       this.cascadeState = null;
       return;
@@ -381,10 +376,6 @@ class RuntimeHarness {
 
     this.notify(formatFailoverTransition(pool.name, currentModel.provider, nextCandidate), "info");
     this.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-    if (prompt) {
-      this.suppressNextStartTurn = true;
-      this.sendUserMessage(prompt);
-    }
     return true;
   }
 
@@ -502,7 +493,7 @@ async function runPoolOnlyChecks() {
 
   const snapshot = harness.snapshot();
   assert.deepEqual(snapshot.setModelCalls, ["anthropic-2:claude-sonnet-4"]);
-  assert.deepEqual(snapshot.sentPrompts, [prompt]);
+  assert.deepEqual(snapshot.sentPrompts, []);
   assert.equal(snapshot.statuses.at(-1), "pool:primary | active anthropic-2 (claude-sonnet-4)");
   assert.equal(
     snapshot.notifications.at(-1).message,
@@ -560,7 +551,7 @@ async function runNoLoopChecks() {
     "google-gemini-cli:gemini-2.5-pro",
   ]);
   assert.deepEqual(snapshot.visitedChainIndexes, [1, 2]);
-  assert.deepEqual(snapshot.sentPrompts, [prompt, prompt, prompt, prompt, prompt]);
+  assert.deepEqual(snapshot.sentPrompts, []);
 
   const warningMessages = snapshot.notifications
     .filter((entry) => entry.level === "warning")
