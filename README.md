@@ -2,6 +2,17 @@
 
 Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 
+## Working on this fork
+
+`~/.pi/agent/npm/node_modules/pi-multi-pass/extensions/multi-sub.ts` is a **file copy** of the published package, not a symlink to this checkout. Committing here changes nothing that pi runs until you copy it across:
+
+```bash
+bash scripts/deploy.sh          # copy over the installed extension (backs the old one up)
+bash scripts/deploy.sh --check  # report drift only, exit 1 if they differ
+```
+
+Already-running pi sessions keep the old copy - extensions load per process. And `pi package update` will overwrite the deployed file with upstream, silently dropping every local fix, so re-run the script afterwards.
+
 ## Install
 
 ```bash
