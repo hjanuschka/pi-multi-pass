@@ -32,7 +32,7 @@
  *   - google-antigravity (Antigravity)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "fs";
 import { dirname, join } from "path";
 import type {
 	ExtensionAPI,
@@ -2445,6 +2445,68 @@ interface PoolState {
 	cooldownMs: number;
 }
 
+// ── Shared exhaustion ledger ───────────────────────────────────────────────
+//
+// `state.exhausted` is per-process, and pi runs many processes: one per pane,
+// one per sub-agent. Each learned "this account is out of credit" the only way
+// available to it - by spending a request and failing. Five sub-agents against
+// two dead accounts is ten wasted calls per wave, every wave, and a parent that
+// already knew could not tell them.
+//
+// The ledger is a flat `{ provider: firstFailureMs }` file next to the config.
+// Deliberately dumb: last write wins, no locking, and a lost write costs one
+// extra failed request rather than correctness. It is a cache of a fact the
+// provider will happily repeat.
+
+const EXHAUSTED_LEDGER_CACHE_MS = 1_000;
+/** Entries older than this are pruned on write; the cooldown is much shorter. */
+const EXHAUSTED_LEDGER_MAX_AGE_MS = 60 * 60 * 1000;
+
+let exhaustedLedgerCache: { readAt: number; data: Record<string, number> } | null = null;
+
+function exhaustedLedgerPath(): string {
+	return join(getAgentDir(), "multi-pass-exhausted.json");
+}
+
+/** Read the ledger, memoised for a second so a planning loop is not IO-bound. */
+function readExhaustedLedger(): Record<string, number> {
+	const now = Date.now();
+	if (exhaustedLedgerCache && now - exhaustedLedgerCache.readAt < EXHAUSTED_LEDGER_CACHE_MS) {
+		return exhaustedLedgerCache.data;
+	}
+	const data: Record<string, number> = {};
+	try {
+		const raw = JSON.parse(readFileSync(exhaustedLedgerPath(), "utf-8"));
+		if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+			for (const [provider, at] of Object.entries(raw)) {
+				if (typeof at === "number" && Number.isFinite(at)) data[provider] = at;
+			}
+		}
+	} catch {
+		// Missing or corrupt: an empty ledger just means everyone re-learns.
+	}
+	exhaustedLedgerCache = { readAt: now, data };
+	return data;
+}
+
+function recordExhaustedInLedger(provider: string, at: number): void {
+	const data: Record<string, number> = { ...readExhaustedLedger(), [provider]: at };
+	for (const [name, ts] of Object.entries(data)) {
+		if (at - ts > EXHAUSTED_LEDGER_MAX_AGE_MS) delete data[name];
+	}
+	const path = exhaustedLedgerPath();
+	try {
+		// Write-then-rename: another process reading mid-write gets the old file
+		// rather than half of this one.
+		const tmp = `${path}.${process.pid}.tmp`;
+		writeFileSync(tmp, JSON.stringify(data, null, 1), "utf-8");
+		renameSync(tmp, path);
+		exhaustedLedgerCache = { readAt: Date.now(), data };
+	} catch {
+		// A read-only home directory must not break failover.
+	}
+}
+
 class PoolManager {
 	private pools: Map<string, PoolConfig> = new Map();
 	private poolStates: Map<string, PoolState> = new Map();
@@ -2508,6 +2570,19 @@ class PoolManager {
 	}
 
 	/** Get available (non-exhausted, authenticated) members of a pool */
+	/**
+	 * When this provider was last seen exhausted, by this process or any other.
+	 * The ledger is what lets a sub-agent skip an account its parent already
+	 * killed, instead of paying a request to discover the same thing.
+	 */
+	private exhaustedAt(state: PoolState, provider: string): number | undefined {
+		const local = state.exhausted.get(provider);
+		const shared = readExhaustedLedger()[provider];
+		if (local === undefined) return shared;
+		if (shared === undefined) return local;
+		return Math.max(local, shared);
+	}
+
 	getAvailableMembers(
 		pool: PoolConfig,
 		authStorage: AuthCompat,
@@ -2516,7 +2591,7 @@ class PoolManager {
 		const now = Date.now();
 		return pool.members.filter((member) => {
 			if (!authStorage.hasAuth(member)) return false;
-			const exhaustedAt = state.exhausted.get(member);
+			const exhaustedAt = this.exhaustedAt(state, member);
 			if (exhaustedAt && now - exhaustedAt < state.cooldownMs) return false;
 			if (exhaustedAt && now - exhaustedAt >= state.cooldownMs) {
 				state.exhausted.delete(member);
@@ -2527,7 +2602,7 @@ class PoolManager {
 
 	isMemberExhausted(pool: PoolConfig, provider: string): boolean {
 		const state = this.getOrCreatePoolState(pool.name);
-		const exhaustedAt = state.exhausted.get(provider);
+		const exhaustedAt = this.exhaustedAt(state, provider);
 		if (!exhaustedAt) return false;
 		if (Date.now() - exhaustedAt >= state.cooldownMs) {
 			state.exhausted.delete(provider);
@@ -2734,7 +2809,11 @@ class PoolManager {
 		const poolName = this.providerToPool.get(providerName);
 		if (!poolName) return;
 		const state = this.getOrCreatePoolState(poolName);
-		state.exhausted.set(providerName, Date.now());
+		const at = Date.now();
+		state.exhausted.set(providerName, at);
+		// Publish it so every other pi process - and every sub-agent spawned from
+		// now on - skips this account instead of re-discovering it.
+		recordExhaustedInLedger(providerName, at);
 	}
 
 	/** Get the next available member in a pool, skipping the current one */
