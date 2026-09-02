@@ -2070,6 +2070,19 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 // Pool rotation engine
 // ==========================================================================
 
+// Every pattern here is a reason to ROTATE TO ANOTHER ACCOUNT. It is not a
+// "was this a 429" test, despite the name: an account that is out of money and
+// an account that is over its rate limit are the same event for this extension,
+// and both must hand the turn to the next pool member or chain entry.
+//
+// Do not restrict this to 429/5xx. Anthropic reports subscription exhaustion as
+// a *400 invalid_request_error* carrying "You're out of extra usage. Ask your
+// workspace admin to add more so you can keep going." - no "limit", no "quota",
+// no "429". Observed 2026-09-02 on Joel's `anthropic` account: the message hit
+// none of the original eight patterns, so `handleError` returned false on its
+// second line and the pool/chain was never consulted. The session died on a
+// live `openai-codex` account that was one chain entry away. See
+// tests/error-classification-check.mjs, which asserts against the real strings.
 const RATE_LIMIT_PATTERNS = [
 	/usage.?limit/i,
 	/rate.?limit/i,
@@ -2079,8 +2092,16 @@ const RATE_LIMIT_PATTERNS = [
 	/capacity/i,
 	/429/,
 	/quota/i,
+	// Subscription/credit exhaustion, which providers do not phrase as a limit.
+	/out of (extra )?usage/i,
+	/credit balance is too low/i,
+	/insufficient[_ ]credit/i,
 ];
 
+/**
+ * True when the provider error means "this account cannot serve this turn, try
+ * another one" - rate limited, over quota, or out of credit.
+ */
 function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
 }
