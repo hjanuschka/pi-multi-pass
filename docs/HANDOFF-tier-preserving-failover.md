@@ -1,5 +1,23 @@
 # Handoff: tier-preserving failover across chain hops
 
+**Status: implemented 2026-09-02.** `resolveTierEquivalent` + the chain-hop mapping, guarded by
+`tests/tier-mapping-check.mjs`, documented in the README under "Tiers". Live evidence, a
+mid-tier session on an exhausted anthropic pool:
+
+```
+advancing to chain all#2; active openai-codex (gpt-5.5) [tier: mid]
+```
+
+and a flagship one on the same config landing on `gpt-5.6-sol [tier: flagship]`.
+
+One correction to the plan below, found while building it: the table must be keyed by the
+pool's **baseProvider**, not by the account. By the time a cascade reaches a chain hop it has
+usually rotated within the pool, so `currentModel.provider` is `anthropic-2`, which no table
+lists. Keying by account silently disabled every mapping; there is a planted-defect test for
+exactly that.
+
+The rest of the file is kept as written, because the reasoning still applies.
+
 Written 2026-09-02 for an agent that will implement this in `~/MYNE/Projects/tools/pi-multi-pass`, branch `fix/pi-0.84-model-runtime`.
 
 Read this whole file before changing anything. Every line number below was checked against the working tree on 2026-09-02; re-verify them before editing, the file is 5,886 lines and moves.

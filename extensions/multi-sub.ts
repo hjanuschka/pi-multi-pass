@@ -1692,11 +1692,77 @@ interface ChainConfig {
 	enabled: boolean;
 }
 
+/**
+ * One rung of the capability ladder, listing the equivalent model at each
+ * provider. Optional: a config without `tiers` keeps the pre-tier behaviour,
+ * where a chain hop uses the chain entry's model whatever the session was on.
+ */
+interface TierConfig {
+	/** User-defined, cosmetic. Appears in the failover status line. */
+	name: string;
+	/** provider name -> model id for that provider at this tier. */
+	models: Record<string, string>;
+}
+
 interface MultiPassConfig {
 	subscriptions: SubEntry[];
 	pools: PoolConfig[];
 	chains: ChainConfig[];
 	presets: PresetConfig[];
+	/** Optional model-equivalence table used when failover crosses pools. */
+	tiers?: TierConfig[];
+}
+
+/**
+ * The model at `toProvider` that sits on the same tier as `fromModelId` does at
+ * `fromProvider`, or undefined when the table cannot answer.
+ *
+ * Keyed by **provider**, never by pool: a pool holds `anthropic` and
+ * `anthropic-2`, which are two accounts on one catalogue, and a pool key could
+ * not distinguish them.
+ *
+ * Callers pass the pool's **baseProvider**, not the account name. By the time a
+ * cascade reaches a chain hop it has usually rotated within the pool already, so
+ * `currentModel.provider` is `anthropic-2` - which no sane table lists, because
+ * a second account on the same subscription has the same catalogue and the same
+ * tiers. Keying the table by account would force every entry to be written
+ * twice and would silently stop mapping the day a third account is added.
+ *
+ * Undefined is a normal answer, not a failure - the
+ * caller falls back to the chain entry's model, which is what makes a config
+ * without `tiers` behave exactly as before.
+ *
+ * Pure, and exported for tests: it is the whole decision surface of tiering.
+ */
+export function resolveTierEquivalent(
+	tiers: TierConfig[] | undefined,
+	fromProvider: string,
+	fromModelId: string,
+	toProvider: string,
+): string | undefined {
+	if (!Array.isArray(tiers)) return undefined;
+	for (const tier of tiers) {
+		if (!tier || typeof tier !== "object" || !tier.models) continue;
+		// First match wins. A model listed in two tiers is a config error; picking
+		// deterministically beats picking the last one read.
+		if (tier.models[fromProvider] !== fromModelId) continue;
+		const mapped = tier.models[toProvider];
+		return typeof mapped === "string" && mapped !== "" ? mapped : undefined;
+	}
+	return undefined;
+}
+
+/** The tier a model belongs to, for the status line. */
+function findTierName(
+	tiers: TierConfig[] | undefined,
+	provider: string,
+	modelId: string,
+): string | undefined {
+	if (!Array.isArray(tiers)) return undefined;
+	for (const tier of tiers) {
+		if (tier?.models?.[provider] === modelId) return tier.name;
+	}
+	return undefined;
 }
 
 /** Project-level config (.pi/multi-pass.json) */
@@ -1717,6 +1783,8 @@ interface EffectiveConfig {
 	pools: PoolConfig[];
 	chains: ChainConfig[];
 	presets: PresetConfig[];
+	/** Model-equivalence table. Global only - a project cannot redefine tiers. */
+	tiers?: TierConfig[];
 	/** Exact provider names allowed in this project, if restricted. */
 	allowedProviderNames?: string[];
 	/** Which project config was loaded from, if any */
@@ -1735,13 +1803,33 @@ function emptyMultiPassConfig(): MultiPassConfig {
 	return { subscriptions: [], pools: [], chains: [], presets: [] };
 }
 
+/** Keep only well-formed tiers, so one bad entry cannot break failover. */
+function normalizeTiers(raw: unknown): TierConfig[] | undefined {
+	if (!Array.isArray(raw)) return undefined;
+	const tiers: TierConfig[] = [];
+	for (const entry of raw) {
+		if (!entry || typeof entry !== "object") continue;
+		const candidate = entry as Partial<TierConfig>;
+		if (typeof candidate.name !== "string" || !candidate.name) continue;
+		if (!candidate.models || typeof candidate.models !== "object") continue;
+		const models: Record<string, string> = {};
+		for (const [provider, modelId] of Object.entries(candidate.models)) {
+			if (typeof modelId === "string" && modelId !== "") models[provider] = modelId;
+		}
+		if (Object.keys(models).length > 0) tiers.push({ name: candidate.name, models });
+	}
+	return tiers.length > 0 ? tiers : undefined;
+}
+
 function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 	const parsed = raw && typeof raw === "object" ? (raw as Partial<MultiPassConfig>) : {};
+	const tiers = normalizeTiers(parsed.tiers);
 	return {
 		subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
 		pools: Array.isArray(parsed.pools) ? parsed.pools : [],
 		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
 		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
+		...(tiers ? { tiers } : {}),
 	};
 }
 
@@ -1819,6 +1907,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 			pools: global.pools,
 			chains: global.chains,
 			presets: global.presets,
+			...(global.tiers ? { tiers: global.tiers } : {}),
 		};
 	}
 
@@ -1841,6 +1930,7 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 		pools,
 		chains,
 		presets: global.presets,
+		...(global.tiers ? { tiers: global.tiers } : {}),
 		allowedProviderNames,
 		projectConfigPath: projectConfigPath(cwd),
 	};
@@ -2577,13 +2667,45 @@ class PoolManager {
 					continue;
 				}
 				foundEligible = true;
+				// A chain entry was designed as "pool + the model to use there". Read
+				// as "pool + how to translate into it", entry.model becomes the
+				// fallback and the session keeps its tier across the hop. Same-pool
+				// rotation above already keeps currentModel.id; this makes the two
+				// agree instead of contradicting each other 70 lines apart.
+				const tierModel = resolveTierEquivalent(
+					config.tiers,
+					pool.baseProvider || currentModel.provider,
+					currentModel.id,
+					targetPool.baseProvider || member,
+				);
+				// A tier naming a model this provider does not serve must not be used:
+				// handleError bails out entirely when modelRegistry.find misses, so one
+				// typo in the table would disable failover rather than degrade it.
+				const tierModelUsable =
+					tierModel !== undefined &&
+					(registryRef?.find(member, tierModel) !== undefined || registryRef === undefined);
+				const useTier = tierModel !== undefined && tierModelUsable;
 				candidates.push({
 					poolName: targetPool.name,
 					provider: member,
-					modelId: entry.model,
+					modelId: useTier ? (tierModel as string) : entry.model,
 					source: "chain",
 					chainName: applicable.chain.name,
 					chainIndex,
+					// Only annotate when a tier table exists, so configs without one
+					// keep byte-identical status lines.
+					...(config.tiers
+						? useTier
+							? {
+								modelSource: "tier" as const,
+								tierName: findTierName(
+									config.tiers,
+									pool.baseProvider || currentModel.provider,
+									currentModel.id,
+								),
+							}
+							: { modelSource: "chain-default" as const }
+						: {}),
 				});
 			}
 			if (!foundEligible) {
@@ -4576,6 +4698,16 @@ interface FailoverCandidate {
 	source: "pool" | "chain";
 	chainName?: string;
 	chainIndex?: number;
+	/**
+	 * Where modelId came from on a chain hop. "tier" means the tier table
+	 * translated the running model into the target provider's equivalent;
+	 * "chain-default" means it fell back to the chain entry's model. The two are
+	 * distinguished in the status line because "why am I suddenly on a different
+	 * model" is the question tiering exists to answer.
+	 */
+	modelSource?: "tier" | "chain-default";
+	/** Tier name when modelSource is "tier". */
+	tierName?: string;
 }
 
 interface FailoverSkip {
@@ -4615,13 +4747,23 @@ interface FailoverCascadeState {
 	visitedChainIndexes: Set<number>;
 }
 
-function formatFailoverTarget(candidate: Pick<FailoverCandidate, "provider" | "modelId">): string {
+function formatFailoverTarget(
+	candidate: Pick<FailoverCandidate, "provider" | "modelId" | "modelSource" | "tierName">,
+): string {
+	// No suffix when nothing translated the model, so a config without tiers
+	// produces exactly the strings it always did.
+	if (candidate.modelSource === "tier" && candidate.tierName) {
+		return `${candidate.provider} (${candidate.modelId}) [tier: ${candidate.tierName}]`;
+	}
+	if (candidate.modelSource === "chain-default") {
+		return `${candidate.provider} (${candidate.modelId}) [chain default]`;
+	}
 	return `${candidate.provider} (${candidate.modelId})`;
 }
 
 function formatFailoverStatus(
 	candidate:
-		| Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex">
+		| Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex" | "modelSource" | "tierName">
 		| null,
 	fallbackPoolName?: string,
 ): string {
@@ -4637,7 +4779,7 @@ function formatFailoverStatus(
 }
 
 function formatFailoverContinuation(
-	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex"> | undefined,
+	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex" | "modelSource" | "tierName"> | undefined,
 ): string {
 	if (!nextCandidate) {
 		return "cascade exhausted; no later eligible target";
@@ -4651,7 +4793,7 @@ function formatFailoverContinuation(
 function formatFailoverTransition(
 	poolName: string,
 	currentProvider: string,
-	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex">,
+	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex" | "modelSource" | "tierName">,
 ): string {
 	const phase = nextCandidate.source === "chain"
 		? `advancing to chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
@@ -5780,6 +5922,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				pools: effective.pools,
 				chains: effective.chains,
 				presets: effective.presets,
+				tiers: effective.tiers,
 			}),
 		);
 

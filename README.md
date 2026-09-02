@@ -285,6 +285,37 @@ If the script throws, returns an invalid provider name, or the file is missing, 
 4. During retry replays for the same prompt, it preserves cascade state and avoids re-trying already attempted providers
 5. Session status shows the active chain start entry: `chain:<name> | starts <pool> -> <model>`
 
+## Tiers: keeping your model's class across a chain hop
+
+A chain entry names one model, so before tiers every hop landed on that model no matter what the session was running. A cheap recon session got promoted to a flagship model, and a flagship session could be quietly demoted mid-task. Neither is an error; you find out from the bill or from a suddenly worse answer.
+
+Add an optional `tiers` table to `~/.pi/agent/multi-pass.json` and the hop keeps the **class** of model you were on:
+
+```json
+"tiers": [
+  { "name": "flagship", "models": { "anthropic": "claude-opus-5",    "openai-codex": "gpt-5.6-sol"  } },
+  { "name": "mid",      "models": { "anthropic": "claude-sonnet-5",  "openai-codex": "gpt-5.5"      } },
+  { "name": "cheap",    "models": { "anthropic": "claude-haiku-4-5", "openai-codex": "gpt-5.4-mini" } }
+]
+```
+
+A `claude-sonnet-5` session whose anthropic pool dries up now lands on `gpt-5.5`, and the status line says which decided it:
+
+```
+advancing to chain all#2; active openai-codex (gpt-5.5) [tier: mid]
+advancing to chain all#2; active openai-codex (gpt-5.6-sol) [chain default]
+```
+
+Rules worth knowing:
+
+- **Optional.** No `tiers` key means the old behaviour, byte for byte, including the status strings.
+- **Keyed by base provider, not by account.** Write `anthropic`, not `anthropic-2`: a second account on the same subscription shares one catalogue, and by the time a cascade hops it has usually rotated within the pool already.
+- **Any gap falls back to the chain entry's model** - a model in no tier, a tier that names nothing for the target provider, or a tier pointing at a model that provider does not serve. That last check matters: an unusable model would otherwise abort the whole cascade.
+- **A model in two tiers is a config error**; the first match wins, deterministically.
+- **Same-pool rotation is untouched.** It always kept your model.
+- **Chains only.** Presets are a separate ordered route list and are not tier-mapped.
+- Do not try to infer tiers from model names. `-mini`, `-opus` and `sol` are vendor marketing and they change; the table is explicit on purpose.
+
 ## Model presets
 
 Presets are named routing shortcuts that map to an ordered list of provider+model entries across different providers. Think of them as intent-based routing: `coding-premium`, `coding-budget`, `fastest`, etc.
