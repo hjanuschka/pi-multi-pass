@@ -51,9 +51,8 @@ import { loginOpenAICodex, refreshOpenAICodexToken } from "@oh-my-pi/pi-ai/utils
 import {
 	loginGitHubCopilot,
 	refreshGitHubCopilotToken,
-	getGitHubCopilotBaseUrl,
-	normalizeDomain,
 } from "@oh-my-pi/pi-ai/utils/oauth/github-copilot";
+
 import { loginGeminiCli, refreshGoogleCloudToken } from "@oh-my-pi/pi-ai/utils/oauth/google-gemini-cli";
 import { loginAntigravity, refreshAntigravityToken } from "@oh-my-pi/pi-ai/utils/oauth/google-antigravity";
 import type {
@@ -157,12 +156,8 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 			};
 		},
 		buildModifyModels(providerName: string) {
-			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
-				const creds = credentials as CopilotCredentials;
-				const domain = creds.enterpriseUrl
-					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
-					: undefined;
-				const baseUrl = getGitHubCopilotBaseUrl(domain);
+			return (models: Model<Api>[]): Model<Api>[] => {
+				const baseUrl = "https://api.githubcopilot.com";
 				return models.map((m) =>
 					m.provider === providerName ? { ...m, baseUrl } : m,
 				);
