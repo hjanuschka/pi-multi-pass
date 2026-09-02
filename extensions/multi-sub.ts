@@ -2106,6 +2106,49 @@ function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
 }
 
+/** Statuses under 500 that pi 0.84.4 retries. Anything else 4xx it gives up on. */
+const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+
+/**
+ * The HTTP status pi folded into `errorMessage`.
+ *
+ * The assistant message carries no status field - captured 2026-09-02, its keys
+ * are role, content, api, provider, model, usage, stopReason, timestamp,
+ * errorMessage - and pi formats the message as `${status} ${body}`:
+ *
+ *   400 {"type":"error","error":{"type":"invalid_request_error", ...
+ *
+ * So the status has to be read back off the string. Returns undefined when the
+ * message carries no status, which callers must treat as "unknown".
+ */
+function parseHttpStatus(errorMessage: string): number | undefined {
+	const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
+	if (leading) return Number(leading[1]);
+	const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
+	if (field) return Number(field[1]);
+	return undefined;
+}
+
+/**
+ * Will pi re-run this turn by itself?
+ *
+ * pi 0.84.4 `isRetryableProviderError` (dist/bundle/chunks/chunk-XNGRGP62.js):
+ * an `x-should-retry` header wins, otherwise 408, 409, 429 and >= 500 retry and
+ * everything else does not.
+ *
+ * This decides whether failover has to replay the prompt after switching
+ * accounts. Getting it wrong is costly in both directions - a missed replay
+ * leaves the turn unexecuted on a healthy account, a spurious one sends the
+ * prompt twice - so an unrecognised message returns **true**: assume pi handles
+ * it, and keep today's rotate-only behaviour rather than risking a duplicate.
+ */
+function piWillRetryTurn(errorMessage: string): boolean {
+	const status = parseHttpStatus(errorMessage);
+	if (status === undefined) return true;
+	if (status >= 500) return true;
+	return PI_RETRYABLE_STATUSES.has(status);
+}
+
 // ==========================================================================
 // Schedule evaluation helpers
 // ==========================================================================
@@ -2891,6 +2934,28 @@ class PoolManager {
 			"info",
 		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
+
+		// Switching the model is not the same as running the turn. pi retries the
+		// failed turn on the new account only for the statuses in piWillRetryTurn;
+		// a 400 - which is how Anthropic reports subscription exhaustion - it never
+		// retries. Measured 2026-09-02 in a real pane: the cascade
+		// anthropic -> anthropic-2 -> openai-codex needed three separate prompts,
+		// one per rotation, because each rotation stopped here.
+		//
+		// A human presses Enter again and barely notices. A sub-agent cannot: it
+		// ends up parked on a healthy account with its task unexecuted, printing no
+		// completion sentinel, and its parent polls it until timeout. So replay,
+		// but only when pi will not - c9f4b3f removed the unconditional replay for
+		// the opposite reason, one duplicate follow-up per failed account, and
+		// tests/failover-turn-integrity-check.mjs still guards that direction.
+		//
+		// "followUp" rather than "steer": this is a new turn on the new provider,
+		// not an injection into the turn that just failed. Without deliverAs, pi
+		// 0.84.4 throws "Agent is already processing", because failover runs while
+		// the failed turn is still streaming.
+		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
+			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
+		}
 
 		return true;
 	}
@@ -5689,9 +5754,11 @@ export default function multiSub(pi: ExtensionAPI) {
 		poolManager.startTurn(event.prompt, ctx.model);
 	});
 
-	// agent_end is emitted before pi 0.84.4's automatic retry settles. Rotate
-	// only: AgentSession retries the same turn with agent.continue(). Enqueuing
-	// lastUserPrompt here would create one duplicate follow-up per failed account.
+	// agent_end is emitted before pi 0.84.4's automatic retry settles. For an
+	// error pi retries (408/409/429/5xx) rotating is enough - AgentSession re-runs
+	// the turn with agent.continue() and enqueuing lastUserPrompt here would
+	// create one duplicate follow-up per failed account. For an error pi does not
+	// retry, handleError replays the turn itself; see piWillRetryTurn.
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
 		if (!event.messages || event.messages.length === 0) return;
 
