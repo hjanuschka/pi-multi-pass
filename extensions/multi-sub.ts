@@ -175,8 +175,19 @@ function flowBackedOAuth(
 	name: string,
 	options?: { usesCallbackServer?: boolean },
 ): Omit<OAuthProviderInterface, "id"> {
+	// Mirror the built-in flow's subscription flag so extra accounts light up
+	// pi's subscription handling (e.g. the footer indicator via
+	// modelRuntime.isUsingSubscription). Guarded: providers without a flow in
+	// the installed pi-ai version must not break registration.
+	let isSubscription: boolean | undefined;
+	try {
+		isSubscription = getBuiltinOAuthFlow(providerId).isSubscription;
+	} catch {
+		// no built-in flow available; leave the flag unset
+	}
 	return {
 		name,
+		isSubscription,
 		usesCallbackServer: options?.usesCallbackServer,
 		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 			return getBuiltinOAuthFlow(providerId).login(toAuthInteraction(callbacks));
