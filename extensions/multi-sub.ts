@@ -1958,6 +1958,56 @@ function cloneModels(originalProvider: string, index: number) {
 	}));
 }
 
+/**
+ * Read the base provider's persisted remote-catalog overlay
+ * (~/.pi/agent/models-store.json). pi refreshes this file for builtin
+ * providers (pi.dev catalog, `pi update --models`, periodic re-checks);
+ * extension-registered providers never receive that overlay, so
+ * subscriptions mirror it from here.
+ */
+function storedOverlayModels(baseProvider: string): Model<Api>[] {
+	try {
+		const storePath = join(getAgentDir(), "models-store.json");
+		if (!existsSync(storePath)) return [];
+		const raw = JSON.parse(readFileSync(storePath, "utf8")) as Record<
+			string,
+			{ models?: unknown }
+		>;
+		const entry = raw[baseProvider];
+		if (!entry || !Array.isArray(entry.models)) return [];
+		return entry.models.filter(
+			(m): m is Model<Api> =>
+				!!m && typeof m === "object" && typeof (m as Model<Api>).id === "string",
+		);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Live model list for a subscription provider: the static builtin catalog
+ * merged with the base provider's persisted remote-catalog overlay (overlay
+ * entries win, mirroring pi's own catalog merge). Returned from
+ * `refreshModels` so catalog additions (e.g. gpt-6-astra) and metadata
+ * updates reach extra accounts on every model refresh cycle without a
+ * pi-multi-pass release.
+ */
+function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
+	const builtin = getModels(entry.provider as any) as Model<Api>[];
+	const overlay = storedOverlayModels(entry.provider);
+	const merged = [...builtin];
+	for (const model of overlay) {
+		const existing = merged.findIndex((m) => m.id === model.id);
+		if (existing >= 0) merged[existing] = model;
+		else merged.push(model);
+	}
+	return merged.map((m) => ({
+		...m,
+		provider: name,
+		name: `${m.name} (#${entry.index})`,
+	}));
+}
+
 // ==========================================================================
 // Register a single subscription as a provider
 // ==========================================================================
@@ -1973,11 +2023,14 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const baseUrl = builtinModels[0]?.baseUrl || "";
 	const models = cloneModels(entry.provider, entry.index);
 
+	// Static `models` is only the startup baseline; refreshModels swaps in the
+	// live merged catalog (builtin + remote overlay) on every refresh cycle.
 	pi.registerProvider(name, {
 		baseUrl,
 		api: builtinModels[0]?.api,
 		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
+		refreshModels: async () => liveSubscriptionModels(entry, name),
 	});
 }
 

@@ -26,6 +26,11 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Project affinity**: Restrict which subs/pools/chains are used per project
 - **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
 - **Labels**: Tag subscriptions (e.g. "work", "personal")
+- **Live model catalogs**: Subscription providers mirror the base provider's
+  merged model catalog (static builtin + pi.dev remote overlay from
+  `models-store.json`) on every model refresh, so newly catalogued models
+  (e.g. `gpt-6-astra` for Codex) reach extra accounts without a
+  pi-multi-pass release
 
 ## Quick start
 
