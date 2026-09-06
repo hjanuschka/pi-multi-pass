@@ -34,8 +34,17 @@
  *   - minimax-cn          (MiniMax China API key)
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
+import {
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "fs";
+import { dirname, isAbsolute, join } from "path";
+import { pathToFileURL } from "url";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -1803,18 +1812,42 @@ function loadEffectiveConfig(cwd: string): EffectiveConfig {
 	};
 }
 
-function saveGlobalConfig(config: MultiPassConfig): void {
-	const path = globalConfigPath();
+function saveJsonConfig(path: string, config: unknown): void {
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+
+	let backupPath: string | undefined;
+	if (existsSync(path)) {
+		try {
+			JSON.parse(readFileSync(path, "utf-8"));
+		} catch {
+			backupPath = `${path}.invalid-${Date.now()}-${process.pid}.bak`;
+			copyFileSync(path, backupPath);
+		}
+	}
+
+	const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+	try {
+		writeFileSync(temporaryPath, JSON.stringify(config, null, 2), "utf-8");
+		renameSync(temporaryPath, path);
+	} catch (error) {
+		try {
+			unlinkSync(temporaryPath);
+		} catch {}
+		throw error;
+	}
+
+	if (backupPath) {
+		console.warn(`[pi-multi-pass] Backed up malformed config to ${backupPath}`);
+	}
+}
+
+function saveGlobalConfig(config: MultiPassConfig): void {
+	saveJsonConfig(globalConfigPath(), config);
 }
 
 function saveProjectConfig(cwd: string, config: ProjectConfig): void {
-	const path = projectConfigPath(cwd);
-	const dir = dirname(path);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+	saveJsonConfig(projectConfigPath(cwd), config);
 }
 
 function getProviderDisplayName(providerName: string, subscriptions: SubEntry[]): string {
@@ -2225,7 +2258,7 @@ function getScheduledMemberOrder(
 const selectorCache = new Map<string, PoolSelectorFn | null>();
 
 function resolveSelectorScriptPath(scriptPath: string): string {
-	if (scriptPath.startsWith("/")) return scriptPath;
+	if (isAbsolute(scriptPath)) return scriptPath;
 	if (scriptPath.startsWith("~/")) {
 		const home = process.env.HOME || process.env.USERPROFILE || "";
 		return join(home, scriptPath.slice(2));
@@ -2245,7 +2278,7 @@ async function loadSelectorScript(scriptPath: string): Promise<PoolSelectorFn | 
 	}
 
 	try {
-		const mod = await import(resolved);
+		const mod = await import(pathToFileURL(resolved).href);
 		const fn: PoolSelectorFn = typeof mod.default === "function"
 			? mod.default
 			: typeof mod === "function"
