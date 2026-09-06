@@ -1,38 +1,70 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const sourcePath = fileURLToPath(new URL("../extensions/multi-sub.ts", import.meta.url));
-const source = await readFile(sourcePath, "utf8");
+const root = join(dirname(fileURLToPath(import.meta.url)), "..");
+const agentDir = mkdtempSync(join(tmpdir(), "pi-multi-pass-minimax-"));
 
-assert.match(source, /apiKey\?: string;/);
-assert.match(source, /baseUrl\?: string;/);
-assert.match(source, /modelIds\?: readonly string\[\];/);
-assert.match(source, /const MINIMAX_MODEL_IDS = \["MiniMax-M3", "MiniMax-M2\.7"\]/);
+try {
+	writeFileSync(join(agentDir, "auth.json"), JSON.stringify({
+		"minimax-2": { type: "api_key", key: "test-global" },
+		"minimax-cn-2": { type: "api_key", key: "test-china" },
+	}));
 
-for (const [provider, apiKey, endpoint] of [
-  ["minimax", "$MINIMAX_API_KEY", "https://api.minimax.io/anthropic"],
-  ["minimax-cn", "$MINIMAX_CN_API_KEY", "https://api.minimaxi.com/anthropic"],
-]) {
-  const providerPattern = provider === "minimax-cn"
-    ? /"minimax-cn": \{([\s\S]*?)\n\t\},/
-    : /\n\tminimax: \{([\s\S]*?)\n\t\},/;
-  const match = source.match(providerPattern);
-  assert.ok(match, `missing provider template: ${provider}`);
-  assert.ok(match[1].includes(`apiKey: "${apiKey}"`));
-  assert.ok(match[1].includes(`baseUrl: "${endpoint}"`));
-  assert.match(match[1], /modelIds: MINIMAX_MODEL_IDS/);
-  assert.match(match[1], /api: "anthropic-messages"/);
+	const result = spawnSync(
+		"pi",
+		[
+			"--mode",
+			"rpc",
+			"--offline",
+			"--no-extensions",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-context-files",
+			"--extension",
+			join(root, "extensions", "multi-sub.ts"),
+		],
+		{
+			cwd: root,
+			env: {
+				...process.env,
+				PI_CODING_AGENT_DIR: agentDir,
+				MULTI_SUB: "minimax:1,minimax-cn:1",
+			},
+			input: '{"id":"models","type":"get_available_models"}\n',
+			encoding: "utf8",
+			timeout: 15_000,
+		},
+	);
+
+	assert.equal(result.error, undefined, result.error?.message);
+	assert.equal(result.status, 0, result.stderr);
+	assert.doesNotMatch(result.stdout, /"type":"extension_error"/, result.stdout);
+
+	const response = result.stdout
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line))
+		.find((event) => event.id === "models");
+	assert.equal(response?.success, true, result.stdout);
+
+	const models = response.data.models;
+	for (const [provider, baseUrl] of [
+		["minimax-2", "https://api.minimax.io/anthropic"],
+		["minimax-cn-2", "https://api.minimaxi.com/anthropic"],
+	]) {
+		const providerModels = models.filter((model) => model.provider === provider);
+		assert.ok(providerModels.length > 0, `missing models for ${provider}`);
+		assert.ok(providerModels.some((model) => model.id === "MiniMax-M3"));
+		assert.ok(providerModels.some((model) => model.id === "MiniMax-M2.7-highspeed"));
+		assert.ok(providerModels.every((model) => model.api === "anthropic-messages"));
+		assert.ok(providerModels.every((model) => model.baseUrl === baseUrl));
+	}
+
+	console.log("MiniMax provider check passed");
+} finally {
+	rmSync(agentDir, { recursive: true, force: true });
 }
-
-const registerStart = source.indexOf("function registerSub(");
-const registerEnd = source.indexOf("\n// ==========================================================================\n// Pool rotation engine", registerStart);
-assert.ok(registerStart >= 0 && registerEnd > registerStart, "registerSub body not found");
-const registerBody = source.slice(registerStart, registerEnd);
-assert.match(registerBody, /template\.baseUrl/);
-assert.match(registerBody, /template\.modelIds/);
-assert.match(registerBody, /apiKey: template\.apiKey/);
-assert.match(registerBody, /buildOAuth\?\./);
-assert.doesNotMatch(source, /buildOAuth\(entry\.index\)\.name/);
-
-console.log("MiniMax provider checks passed");
