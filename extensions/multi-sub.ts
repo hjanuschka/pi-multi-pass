@@ -45,10 +45,14 @@ import {
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
+	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
-import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import {
+	builtinProviders,
+	getBuiltinModels as getModels,
+} from "@earendil-works/pi-ai/providers/all";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	Container,
 	Key,
@@ -336,6 +340,32 @@ interface AuthStorageEntry {
 	accountId?: string;
 	projectId?: string;
 	[key: string]: unknown;
+}
+
+interface AuthStorageCompat {
+	hasAuth(provider: string): boolean;
+	get(provider: string): AuthStorageEntry | undefined;
+	logout(provider: string): Promise<void>;
+}
+
+function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthStorageCompat {
+	const registry = ctx.modelRegistry as unknown as {
+		authStorage?: AuthStorageCompat;
+		runtime?: { logout(provider: string): Promise<void> };
+		getProviderAuthStatus(provider: string): { configured: boolean };
+	};
+	if (registry.authStorage) return registry.authStorage;
+
+	return {
+		hasAuth: (provider) => registry.getProviderAuthStatus(provider).configured,
+		get: (provider) => readStoredCredential(provider) as AuthStorageEntry | undefined,
+		logout: async (provider) => {
+			if (!registry.runtime) {
+				throw new Error("This pi version does not expose credential logout");
+			}
+			await registry.runtime.logout(provider);
+		},
+	};
 }
 
 interface QuotaAccount {
@@ -1022,7 +1052,7 @@ async function resolveGoogleQuotaAccess(
 		&& auth.access.length > 0
 		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
 	if (hasFreshAccess) {
-		return { accessToken: auth.access, projectId };
+		return { accessToken: auth.access!, projectId };
 	}
 
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
@@ -1282,12 +1312,12 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 			providerName,
 			baseProvider: getBaseProvider(providerName) || providerName,
 			displayName,
-			auth: ctx.modelRegistry.authStorage.get(providerName) as AuthStorageEntry | undefined,
+			auth: getAuthStorage(ctx).get(providerName) as AuthStorageEntry | undefined,
 		});
 	};
 
 	for (const checker of PROVIDER_QUOTA_CHECKERS) {
-		if (ctx.modelRegistry.authStorage.hasAuth(checker.baseProvider)) {
+		if (getAuthStorage(ctx).hasAuth(checker.baseProvider)) {
 			pushAccount(
 				checker.baseProvider,
 				PROVIDER_TEMPLATES[checker.baseProvider]?.displayName || checker.baseProvider,
@@ -1807,7 +1837,7 @@ function getProjectScopedProviderNames(
 	}
 
 	for (const providerName of SUPPORTED_PROVIDERS) {
-		if (ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+		if (getAuthStorage(ctx).hasAuth(providerName)) {
 			push(providerName);
 		}
 	}
@@ -1822,7 +1852,7 @@ function findSelectableModelForProvider(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -2616,7 +2646,7 @@ class PoolManager {
 				const best = await this.getQuotaBestMember(
 					pool,
 					currentModel.provider,
-					ctx.modelRegistry.authStorage,
+					getAuthStorage(ctx),
 					cascade.attemptedProviders,
 				);
 				if (best) {
@@ -2779,7 +2809,7 @@ class PoolManager {
 		const plan = this.buildFailoverPlan(
 			currentModel,
 			config,
-			ctx.modelRegistry.authStorage,
+			getAuthStorage(ctx),
 			{
 				attemptedProviders: cascade.attemptedProviders,
 				visitedChainIndexes: cascade.visitedChainIndexes,
@@ -2912,7 +2942,7 @@ function getSwitchableProviderOptions(
 	const seen = new Set<string>();
 	const push = (providerName: string, label: string, description: string) => {
 		if (allowed && !allowed.has(providerName)) return;
-		if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) return;
+		if (!getAuthStorage(ctx).hasAuth(providerName)) return;
 		if (seen.has(providerName)) return;
 		seen.add(providerName);
 		options.push({ providerName, label, description });
@@ -2936,7 +2966,7 @@ function resolveSwitchTargetModel(
 	providerName: string,
 	preferredModelId?: string,
 ): Model<Api> | undefined {
-	if (!ctx.modelRegistry.authStorage.hasAuth(providerName)) {
+	if (!getAuthStorage(ctx).hasAuth(providerName)) {
 		return undefined;
 	}
 	if (preferredModelId) {
@@ -3052,8 +3082,8 @@ async function removeSubscriptionEntry(
 	if (!confirmed) return;
 
 	const name = subProviderName(entry);
-	if (ctx.modelRegistry.authStorage.hasAuth(name)) {
-		ctx.modelRegistry.authStorage.logout(name);
+	if (getAuthStorage(ctx).hasAuth(name)) {
+		await getAuthStorage(ctx).logout(name);
 	}
 	pi.unregisterProvider(name);
 
@@ -3093,7 +3123,7 @@ async function showSubscriptionActions(
 			items: [
 				{
 					value: subProviderName(entry),
-					label: formatSubscriptionListLine(entry, config, ctx.modelRegistry.authStorage),
+					label: formatSubscriptionListLine(entry, config, getAuthStorage(ctx)),
 				},
 			],
 			confirmHint: "back",
@@ -3103,7 +3133,7 @@ async function showSubscriptionActions(
 	}
 
 	const name = subProviderName(entry);
-	const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
+	const hasAuth = getAuthStorage(ctx).hasAuth(name);
 	const actionItems: SelectItem[] = [
 		{ value: "rename", label: "rename", description: "Change friendly label" },
 		hasAuth
@@ -3132,8 +3162,7 @@ async function showSubscriptionActions(
 		return;
 	}
 	if (action === "logout") {
-		ctx.modelRegistry.authStorage.logout(name);
-		ctx.modelRegistry.refresh();
+		await getAuthStorage(ctx).logout(name);
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
 	}
@@ -3165,7 +3194,7 @@ async function handleSubsList(
 			items: all.map((entry) => ({
 				value: subProviderName(entry),
 				label: subDisplayName(entry),
-				description: formatSubscriptionMeta(entry, config, ctx.modelRegistry.authStorage),
+				description: formatSubscriptionMeta(entry, config, getAuthStorage(ctx)),
 			})),
 			initialValue: preferredProviderName,
 			confirmHint: "open",
@@ -3256,7 +3285,7 @@ async function handleSubsRemove(
 		items: config.subscriptions.map((entry) => ({
 			value: subProviderName(entry),
 			label: subDisplayName(entry),
-			description: ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry))
+			description: getAuthStorage(ctx).hasAuth(subProviderName(entry))
 				? "logged in"
 				: "not logged in",
 		})),
@@ -3279,7 +3308,7 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const notLoggedIn = all.filter(
-		(entry) => !ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
+		(entry) => !getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (notLoggedIn.length === 0) {
@@ -3321,7 +3350,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
 
 	const loggedIn = all.filter((entry) =>
-		ctx.modelRegistry.authStorage.hasAuth(subProviderName(entry)),
+		getAuthStorage(ctx).hasAuth(subProviderName(entry)),
 	);
 
 	if (loggedIn.length === 0) {
@@ -3346,8 +3375,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	const entry = loggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
 	if (!entry) return;
 
-	ctx.modelRegistry.authStorage.logout(subProviderName(entry));
-	ctx.modelRegistry.refresh();
+	await getAuthStorage(ctx).logout(subProviderName(entry));
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
 
@@ -3364,14 +3392,14 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 	const lines: string[] = [];
 	for (const entry of all) {
 		const name = subProviderName(entry);
-		const cred = ctx.modelRegistry.authStorage.get(name);
-		const hasAuth = ctx.modelRegistry.authStorage.hasAuth(name);
+		const cred = getAuthStorage(ctx).get(name);
+		const hasAuth = getAuthStorage(ctx).hasAuth(name);
 
 		let status: string;
 		if (!hasAuth) {
 			status = "not logged in";
 		} else if (cred?.type === "oauth") {
-			const expiresIn = cred.expires - Date.now();
+			const expiresIn = typeof cred.expires === "number" ? cred.expires - Date.now() : 0;
 			if (expiresIn > 0) {
 				const mins = Math.round(expiresIn / 60000);
 				status = `logged in (expires ${mins}m)`;
@@ -3630,14 +3658,14 @@ async function editPoolMembers(
 		const removableItems: SelectItem[] = selectedMembers.map((member) => ({
 			value: `remove:${member}`,
 			label: `remove ${member}`,
-			description: ctx.modelRegistry.authStorage.hasAuth(member) ? "logged in" : "not logged in",
+			description: getAuthStorage(ctx).hasAuth(member) ? "logged in" : "not logged in",
 		}));
 		const addableItems: SelectItem[] = availableProviders
 			.filter((providerName) => !selectedMembers.includes(providerName))
 			.map((providerName) => ({
 				value: `add:${providerName}`,
 				label: `add ${providerName}`,
-				description: ctx.modelRegistry.authStorage.hasAuth(providerName)
+				description: getAuthStorage(ctx).hasAuth(providerName)
 					? "logged in"
 					: "not logged in",
 			}));
@@ -3725,7 +3753,7 @@ async function promptForPoolDefinition(
 
 	const allProviders = getAllProvidersForBase(baseProvider, allSubs);
 	const authedProviders = allProviders.filter((p) =>
-		ctx.modelRegistry.authStorage.hasAuth(p),
+		getAuthStorage(ctx).hasAuth(p),
 	);
 
 	if (authedProviders.length === 0) {
@@ -3745,7 +3773,7 @@ async function promptForPoolDefinition(
 		const optionsList = [
 			`--- Selected (${members.length}): ${members.join(", ") || "none"} ---`,
 			...remaining.map((p) => {
-				const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+				const authed = getAuthStorage(ctx).hasAuth(p);
 				return `${p} ${authed ? "[logged in]" : "[not logged in]"}`;
 			}),
 			"[Done - create pool]",
@@ -3974,7 +4002,7 @@ async function inspectPoolConfig(
 	await showWrappedSelect(ctx, {
 		title: `Pool Status: ${pool.name}`,
 		subtitle: "Press Enter or Escape to go back to the pools list.",
-		items: formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager)
+		items: formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager)
 			.map((line, index) => ({ value: `${index}:${line}`, label: line })),
 		confirmHint: "back",
 		cancelHint: "back",
@@ -4219,7 +4247,7 @@ async function handlePoolList(
 			items: pools.map((pool) => ({
 				value: pool.name,
 				label: pool.name,
-				description: formatPoolListDescription(pool, ctx.modelRegistry.authStorage, poolManager),
+				description: formatPoolListDescription(pool, getAuthStorage(ctx), poolManager),
 			})),
 			initialValue: preferredPoolName,
 			confirmHint: "open",
@@ -4397,7 +4425,7 @@ async function handlePoolStatus(
 	const lines: string[] = [];
 	for (const pool of config.pools) {
 		lines.push(
-			...formatPoolStatusLines(pool, ctx.modelRegistry.authStorage, poolManager),
+			...formatPoolStatusLines(pool, getAuthStorage(ctx), poolManager),
 		);
 	}
 
@@ -4790,7 +4818,7 @@ async function handlePoolChainList(
 	await ctx.ui.select(
 		"Chains",
 		config.chains.map((chain) =>
-			formatChainListLine(chain, config, ctx.modelRegistry.authStorage, poolManager),
+			formatChainListLine(chain, config, getAuthStorage(ctx), poolManager),
 		),
 	);
 }
@@ -4870,7 +4898,7 @@ async function handlePoolChainStatus(
 
 	await ctx.ui.select(
 		`Chain Status: ${chain.name}`,
-		formatChainStatusLines(chain, config, ctx.modelRegistry.authStorage, poolManager),
+		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager),
 	);
 }
 
@@ -4958,7 +4986,7 @@ async function handlePoolProject(
 		const allSubs = normalizeEntries(mergeConfigs(globalConf, envEntries));
 		const allProviderNames = [
 			...SUPPORTED_PROVIDERS.filter((p) =>
-				ctx.modelRegistry.authStorage.hasAuth(p),
+				getAuthStorage(ctx).hasAuth(p),
 			),
 			...allSubs.map((s) => subProviderName(s)),
 		];
@@ -4979,7 +5007,7 @@ async function handlePoolProject(
 			const options = [
 				`--- Allowed (${allowed.length}): ${allowed.join(", ") || "all (no restriction)"} ---`,
 				...remaining.map((p) => {
-					const authed = ctx.modelRegistry.authStorage.hasAuth(p);
+					const authed = getAuthStorage(ctx).hasAuth(p);
 					const current = currentAllowed.includes(p) ? " [currently allowed]" : "";
 					return `${p} ${authed ? "[logged in]" : "[not logged in]"}${current}`;
 				}),
@@ -5110,7 +5138,7 @@ async function handlePoolProject(
 		lines.push("");
 		lines.push(`Effective subs (${effective.subscriptions.length}):`);
 		for (const sub of effective.subscriptions) {
-			const authed = ctx.modelRegistry.authStorage.hasAuth(subProviderName(sub));
+			const authed = getAuthStorage(ctx).hasAuth(subProviderName(sub));
 			lines.push(`  ${subDisplayName(sub)} -- ${authed ? "logged in" : "not logged in"}`);
 		}
 
@@ -5381,7 +5409,7 @@ async function handlePresetActivate(
 
 	for (const entry of preset.entries) {
 		if (!entry.enabled) continue;
-		if (!ctx.modelRegistry.authStorage.hasAuth(entry.provider)) continue;
+		if (!getAuthStorage(ctx).hasAuth(entry.provider)) continue;
 		const model = ctx.modelRegistry.find(entry.provider, entry.model);
 		if (!model) continue;
 
@@ -5641,7 +5669,7 @@ export default function multiSub(pi: ExtensionAPI) {
 			if (pool) {
 				const available = poolManager.getAvailableMembers(
 					pool,
-					ctx.modelRegistry.authStorage,
+					getAuthStorage(ctx),
 				);
 				if (available.length === 0) {
 					ctx.ui.notify(
@@ -5729,7 +5757,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainMenu(ctx, poolManager);
 						case "list":
 						case "ls":
-							return handlePoolChainList(ctx);
+							return handlePoolChainList(ctx, poolManager);
 						case "toggle":
 							return handlePoolChainToggle(ctx);
 						case "remove":
@@ -5738,7 +5766,7 @@ export default function multiSub(pi: ExtensionAPI) {
 							return handlePoolChainRemove(ctx);
 						case "status":
 						case "info":
-							return handlePoolChainStatus(ctx);
+							return handlePoolChainStatus(ctx, poolManager);
 						case "create":
 						case "new":
 							return handlePoolChainCreate(ctx, poolManager);
