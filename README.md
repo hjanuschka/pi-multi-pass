@@ -20,6 +20,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Rotation pools**: Group subscriptions and auto-rotate on rate limits
 - **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
 - **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
+- **Opt-in routing trace**: Record recent selection, skip, and failover decisions only when requested
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
 - **Smarter retries**: Preserve failover progress across internal replay retries
@@ -41,6 +42,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 /subs limits           Check built-in quota support (Codex + Google)
 /pool create           Group subs into a rotation pool (with strategy selection)
 /pool chain create     Build an ordered fallback chain across pools
+/pool trace start      Start recording routing decisions for this session
 /mp-preset create         Create a named routing preset across providers
 /mp-preset coding-premium Activate a preset by name
 ```
@@ -73,7 +75,22 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /pool toggle       Enable/disable a pool
 /pool remove       Delete a pool (keeps subscriptions; prunes linked chain entries)
 /pool status       Member health (logged in, rate limited, cooling down)
+/pool trace        Manage the opt-in routing decision trace
 /pool project      Project-level config (restrict subs, override pools/chains)
+```
+
+### `/pool trace` -- Opt-in routing decisions
+
+Tracing is disabled by default and stores nothing until explicitly started. Entries
+are kept only in memory for the current pi session, with the newest 100 retained.
+Prompt contents are not recorded.
+
+```
+/pool trace start   Clear old entries and begin recording
+/pool trace show    Inspect selections, skipped candidates, and failovers
+/pool trace status  Show whether recording is active
+/pool trace stop    Stop recording while retaining captured entries
+/pool trace clear   Delete captured entries
 ```
 
 ### `/pool chain` -- Ordered fallback chain management

@@ -2356,6 +2356,24 @@ interface PoolState {
 	cooldownMs: number;
 }
 
+interface RoutingTraceEntry {
+	timestamp: number;
+	message: string;
+}
+
+const MAX_ROUTING_TRACE_ENTRIES = 100;
+
+function summarizeTraceError(errorMessage: string): string {
+	const status = parseHttpStatus(errorMessage);
+	if (status !== undefined) return `HTTP ${status}`;
+	if (/usage.?limit/i.test(errorMessage)) return "usage limit";
+	if (/rate.?limit|too many requests/i.test(errorMessage)) return "rate limit";
+	if (/overloaded/i.test(errorMessage)) return "overloaded";
+	if (/capacity/i.test(errorMessage)) return "capacity";
+	if (/quota/i.test(errorMessage)) return "quota";
+	return "provider error";
+}
+
 class PoolManager {
 	private pools: Map<string, PoolConfig> = new Map();
 	private poolStates: Map<string, PoolState> = new Map();
@@ -2364,9 +2382,40 @@ class PoolManager {
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
 	private suppressNextStartTurn = false;
+	private traceEnabled = false;
+	private routingTrace: RoutingTraceEntry[] = [];
 
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+	}
+
+	startTrace(): void {
+		this.routingTrace = [];
+		this.traceEnabled = true;
+	}
+
+	stopTrace(): void {
+		this.traceEnabled = false;
+	}
+
+	clearTrace(): void {
+		this.routingTrace = [];
+	}
+
+	isTraceEnabled(): boolean {
+		return this.traceEnabled;
+	}
+
+	getRoutingTrace(): RoutingTraceEntry[] {
+		return this.routingTrace.map((entry) => ({ ...entry }));
+	}
+
+	private recordTrace(message: string): void {
+		if (!this.traceEnabled) return;
+		this.routingTrace.push({ timestamp: Date.now(), message });
+		if (this.routingTrace.length > MAX_ROUTING_TRACE_ENTRIES) {
+			this.routingTrace.splice(0, this.routingTrace.length - MAX_ROUTING_TRACE_ENTRIES);
+		}
 	}
 
 	private getOrCreatePoolState(poolName: string): PoolState {
@@ -2727,6 +2776,7 @@ class PoolManager {
 							`[pool:${pool.name}] quota-first: ${best} has the most remaining quota`,
 							"info",
 						);
+						this.recordTrace(`${best} ranked first by quota-first in pool ${pool.name}`);
 					}
 				}
 			} catch {
@@ -2755,6 +2805,7 @@ class PoolManager {
 					`[pool:${pool.name}] scheduled: ${first} selected by schedule priority`,
 					"info",
 				);
+				this.recordTrace(`${first} ranked first by schedule in pool ${pool.name}`);
 			}
 			return;
 		}
@@ -2780,6 +2831,7 @@ class PoolManager {
 							`[pool:${pool.name}] custom: selector chose ${best}`,
 							"info",
 						);
+						this.recordTrace(`${best} ranked first by custom selector in pool ${pool.name}`);
 					}
 				}
 			} catch {
@@ -2828,6 +2880,11 @@ class PoolManager {
 				attemptedProviders: new Set(currentModel ? [currentModel.provider] : []),
 				visitedChainIndexes: new Set<number>(),
 			};
+			if (currentModel) {
+				const pool = this.getPoolForProvider(currentModel.provider);
+				const source = pool ? `pool ${pool.name} (${pool.strategy || "round-robin"})` : "current model";
+				this.recordTrace(`turn started on ${currentModel.provider} (${currentModel.id}) via ${source}`);
+			}
 			return;
 		}
 		if (currentModel) {
@@ -2868,6 +2925,7 @@ class PoolManager {
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) return false;
 
+		this.recordTrace(`${currentModel.provider} failed with ${summarizeTraceError(errorMessage)}`);
 		const cascade = this.ensureCascadeState(lastUserPrompt, currentModel);
 
 		// Mark current as exhausted before planning the forward-only cascade.
@@ -2899,12 +2957,14 @@ class PoolManager {
 				`[pool:${skip.poolName}] ${skip.detail}; ${continuation}`,
 				"warning",
 			);
+			this.recordTrace(skip.detail);
 		}
 
 		const nextCandidate = plan.candidates[0];
 		if (!nextCandidate) {
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
+			this.recordTrace(`failover exhausted in pool ${pool.name}`);
 			return false;
 		}
 
@@ -2914,6 +2974,7 @@ class PoolManager {
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
 				"warning",
 			);
+			this.recordTrace(`${nextCandidate.provider} skipped because model ${nextCandidate.modelId} is unavailable`);
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
@@ -2925,6 +2986,7 @@ class PoolManager {
 				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
 				"warning",
 			);
+			this.recordTrace(`${nextCandidate.provider} skipped because authentication was unavailable`);
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
 			return false;
@@ -2940,10 +3002,19 @@ class PoolManager {
 			"info",
 		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
+		const route = nextCandidate.source === "chain"
+			? `chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
+			: `pool ${nextCandidate.poolName} (${pool.strategy || "round-robin"})`;
+		this.recordTrace(`selected ${nextCandidate.provider} (${nextCandidate.modelId}) via ${route}`);
 
 		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
 			this.suppressNextStartTurn = true;
 			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
+			this.recordTrace("queued follow-up because pi will not retry this error");
+		} else if (piWillRetryTurn(errorMessage)) {
+			this.recordTrace("waiting for pi to retry the turn");
+		} else {
+			this.recordTrace("turn cannot be replayed because no prompt was captured");
 		}
 
 		return true;
@@ -5214,6 +5285,75 @@ async function handlePoolProject(
 	}
 }
 
+async function handlePoolTrace(
+	ctx: ExtensionCommandContext,
+	poolManager: PoolManager,
+	action?: string,
+): Promise<void> {
+	let selectedAction = action;
+	if (!selectedAction) {
+		selectedAction = await showWrappedSelect(ctx, {
+			title: "Routing Trace",
+			subtitle: poolManager.isTraceEnabled() ? "Recording is active." : "Recording is off until explicitly started.",
+			items: [
+				{ value: "start", label: "start", description: "Clear old entries and begin recording" },
+				{ value: "show", label: "show", description: "Inspect recorded routing decisions" },
+				{ value: "stop", label: "stop", description: "Stop recording and retain entries" },
+				{ value: "clear", label: "clear", description: "Delete recorded entries" },
+				{ value: "status", label: "status", description: "Show recording state and entry count" },
+			],
+			confirmHint: "run",
+			cancelHint: "back",
+		});
+	}
+	if (!selectedAction) return;
+
+	switch (selectedAction) {
+		case "start":
+			poolManager.startTrace();
+			ctx.ui.notify("Routing trace started; previous entries cleared", "info");
+			return;
+		case "stop":
+			poolManager.stopTrace();
+			ctx.ui.notify("Routing trace stopped; recorded entries retained", "info");
+			return;
+		case "clear":
+			poolManager.clearTrace();
+			ctx.ui.notify("Routing trace cleared", "info");
+			return;
+		case "status": {
+			const state = poolManager.isTraceEnabled() ? "recording" : "stopped";
+			ctx.ui.notify(`Routing trace: ${state}, ${poolManager.getRoutingTrace().length} entries`, "info");
+			return;
+		}
+		case "show": {
+			const entries = poolManager.getRoutingTrace();
+			if (entries.length === 0) {
+				ctx.ui.notify(
+					poolManager.isTraceEnabled()
+						? "Routing trace is recording but has no entries yet"
+						: "Routing trace is empty; run /pool trace start first",
+					"info",
+				);
+				return;
+			}
+			await showWrappedSelect(ctx, {
+				title: "Routing Trace",
+				subtitle: `${entries.length} most recent decisions (maximum ${MAX_ROUTING_TRACE_ENTRIES}).`,
+				items: entries.map((entry, index) => ({
+					value: String(index),
+					label: `${new Date(entry.timestamp).toLocaleTimeString()}  ${entry.message}`,
+				})),
+				confirmHint: "close",
+				cancelHint: "close",
+			});
+			return;
+		}
+		default:
+			return handlePoolTrace(ctx, poolManager);
+	}
+}
+
 async function handlePoolMenu(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
@@ -5225,6 +5365,7 @@ async function handlePoolMenu(
 		"toggle   -- Enable/disable a pool",
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
+		"trace    -- Opt-in routing decision trace",
 		"project  -- Project-level pool config (.pi/multi-pass.json)",
 	];
 
@@ -5245,6 +5386,8 @@ async function handlePoolMenu(
 			return handlePoolRemove(ctx, poolManager);
 		case "status":
 			return handlePoolStatus(ctx, poolManager);
+		case "trace":
+			return handlePoolTrace(ctx, poolManager);
 		case "project":
 			return handlePoolProject(ctx, poolManager);
 	}
@@ -5797,7 +5940,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("pool", {
 		description: "Manage subscription rotation pools",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "project"];
+			const subcommands = ["create", "list", "chain", "toggle", "remove", "status", "trace", "project"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -5811,6 +5954,7 @@ export default function multiSub(pi: ExtensionAPI) {
 				.filter(Boolean);
 			const subcommand = parts[0] || "";
 			const chainSubcommand = parts[1] || "";
+			const traceSubcommand = parts[1] || "";
 			switch (subcommand) {
 				case "create":
 				case "new":
@@ -5849,6 +5993,8 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "status":
 				case "info":
 					return handlePoolStatus(ctx, poolManager);
+				case "trace":
+					return handlePoolTrace(ctx, poolManager, traceSubcommand || undefined);
 				case "project":
 					return handlePoolProject(ctx, poolManager);
 				default:
