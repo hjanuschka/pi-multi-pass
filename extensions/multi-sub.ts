@@ -46,28 +46,8 @@ import {
 	getAgentDir,
 	keyHint,
 } from "@earendil-works/pi-coding-agent";
-import {
-	anthropicOAuthProvider,
-	loginAnthropic,
-	refreshAnthropicToken,
-	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
-	githubCopilotOAuthProvider,
-	loginGitHubCopilot,
-	refreshGitHubCopilotToken,
-	getGitHubCopilotBaseUrl,
-	normalizeDomain,
-	geminiCliOAuthProvider,
-	loginGeminiCli,
-	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
-	type OAuthCredentials,
-	type OAuthLoginCallbacks,
-	type OAuthProviderInterface,
-} from "@earendil-works/pi-ai/oauth";
+import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
 import {
 	Container,
@@ -85,9 +65,178 @@ import {
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
+// pi-ai >= 0.84 turned `@earendil-works/pi-ai/oauth` into a type-only entry:
+// the runtime login/refresh helpers this extension used to import are gone.
+// Resolve each built-in provider's OAuth flow from the provider catalog and
+// adapt it to the legacy callback interface `pi.registerProvider()` expects.
+
+/** Legacy extension OAuth provider shape accepted by `pi.registerProvider()`. */
+interface OAuthProviderInterface {
+	id?: string;
+	name: string;
+	isSubscription?: boolean;
+	usesCallbackServer?: boolean;
+	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+	refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
+	getApiKey(credentials: OAuthCredentials): string;
+	modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
+}
+
+/** New pi-ai OAuth flow surface (`OAuthAuth`), resolved from the built-in catalog. */
+interface BuiltinOAuthFlow {
+	name: string;
+	isSubscription?: boolean;
+	login(interaction: {
+		signal: AbortSignal;
+		notify(event: AuthEventLike): void;
+		prompt(prompt: AuthPromptLike): Promise<string>;
+	}): Promise<OAuthCredentials>;
+	refresh(credential: OAuthCredentials & { type: "oauth" }, signal: AbortSignal): Promise<OAuthCredentials>;
+}
+
+interface AuthPromptLike {
+	type: "text" | "secret" | "select" | "manual_code";
+	message: string;
+	placeholder?: string;
+	options?: readonly { id: string; label: string }[];
+}
+
+interface AuthEventLike {
+	type: "info" | "auth_url" | "device_code" | "progress";
+	url?: string;
+	instructions?: string;
+	message?: string;
+	userCode?: string;
+	verificationUri?: string;
+	intervalSeconds?: number;
+	expiresInSeconds?: number;
+}
+
+const builtinOAuthFlows = new Map<string, BuiltinOAuthFlow>();
+
+function getBuiltinOAuthFlow(providerId: string): BuiltinOAuthFlow {
+	const cached = builtinOAuthFlows.get(providerId);
+	if (cached) return cached;
+	const flow = builtinProviders().find((p) => p.id === providerId)?.auth?.oauth as
+		| BuiltinOAuthFlow
+		| undefined;
+	if (!flow || typeof flow.login !== "function" || typeof flow.refresh !== "function") {
+		throw new Error(`No built-in OAuth flow available for provider "${providerId}"`);
+	}
+	builtinOAuthFlows.set(providerId, flow);
+	return flow;
+}
+
+/** Adapt legacy OAuthLoginCallbacks to the new pi-ai AuthInteraction surface. */
+function toAuthInteraction(callbacks: OAuthLoginCallbacks) {
+	return {
+		signal: callbacks.signal ?? new AbortController().signal,
+		notify(event: AuthEventLike): void {
+			if (event.type === "auth_url" && event.url) {
+				callbacks.onAuth({ url: event.url, instructions: event.instructions });
+			} else if (event.type === "device_code" && event.userCode && event.verificationUri) {
+				callbacks.onDeviceCode({
+					userCode: event.userCode,
+					verificationUri: event.verificationUri,
+					intervalSeconds: event.intervalSeconds,
+					expiresInSeconds: event.expiresInSeconds,
+					});
+			} else if (event.type === "progress" && typeof event.message === "string") {
+				callbacks.onProgress?.(event.message);
+			}
+		},
+		prompt(prompt: AuthPromptLike): Promise<string> {
+			if (prompt.type === "select") {
+				return callbacks
+					.onSelect({
+						message: prompt.message,
+						options: (prompt.options ?? []).map((o) => ({ id: o.id, label: o.label })),
+					})
+					.then((selected) => selected ?? "");
+			}
+			if (prompt.type === "manual_code" && callbacks.onManualCodeInput) {
+				return callbacks.onManualCodeInput();
+			}
+			return callbacks.onPrompt({ message: prompt.message, placeholder: prompt.placeholder });
+		},
+	};
+}
+
+function asOAuthCredential(credentials: OAuthCredentials): OAuthCredentials & { type: "oauth" } {
+	const type = (credentials as { type?: string }).type;
+	return type === "oauth"
+		? (credentials as OAuthCredentials & { type: "oauth" })
+		: { ...credentials, type: "oauth" };
+}
+
+/** Build a legacy OAuth provider config backed by a built-in provider flow. */
+function flowBackedOAuth(
+	providerId: string,
+	name: string,
+	options?: { usesCallbackServer?: boolean },
+): Omit<OAuthProviderInterface, "id"> {
+	// Mirror the built-in flow's subscription flag so extra accounts light up
+	// pi's subscription handling (e.g. the footer indicator via
+	// modelRuntime.isUsingSubscription). Guarded: providers without a flow in
+	// the installed pi-ai version must not break registration.
+	let isSubscription: boolean | undefined;
+	try {
+		isSubscription = getBuiltinOAuthFlow(providerId).isSubscription;
+	} catch {
+		// no built-in flow available; leave the flag unset
+	}
+	return {
+		name,
+		isSubscription,
+		usesCallbackServer: options?.usesCallbackServer,
+		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+			return getBuiltinOAuthFlow(providerId).login(toAuthInteraction(callbacks));
+		},
+		async refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
+			return getBuiltinOAuthFlow(providerId).refresh(
+				asOAuthCredential(credentials),
+				signal ?? new AbortController().signal,
+			);
+		},
+		getApiKey(credentials: OAuthCredentials): string {
+			return credentials.access;
+		},
+	};
+}
+
+// GitHub Copilot base URL derivation, ported from the pi-ai OAuth flow
+// (no longer part of the public pi-ai surface).
+
+function normalizeDomain(input: string): string | null {
+	const trimmed = input.trim();
+	if (!trimmed) return null;
+	try {
+		const url = trimmed.includes("://") ? new URL(trimmed) : new URL(`https://${trimmed}`);
+		return url.hostname;
+	} catch {
+		return null;
+	}
+}
+
+function getBaseUrlFromCopilotToken(token: string): string | null {
+	const match = token.match(/proxy-ep=([^;]+)/);
+	if (!match) return null;
+	// Convert proxy.xxx to api.xxx
+	return `https://${match[1].replace(/^proxy\./, "api.")}`;
+}
+
+function getGitHubCopilotBaseUrl(token: string | undefined, enterpriseUrl: string | undefined): string {
+	if (token) {
+		const fromToken = getBaseUrlFromCopilotToken(token);
+		if (fromToken) return fromToken;
+	}
+	const domain = enterpriseUrl ? normalizeDomain(enterpriseUrl) : null;
+	if (domain) return `https://copilot-api.${domain}`;
+	return "https://api.individual.githubcopilot.com";
+}
+
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
 	usesCallbackServer?: boolean;
 	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
 	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
@@ -96,85 +245,30 @@ interface ProviderTemplate {
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 	anthropic: {
 		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `Anthropic #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAnthropic({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshAnthropicToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return flowBackedOAuth("anthropic", `Anthropic #${index}`);
 		},
 	},
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `ChatGPT Codex #${index}`,
+			return flowBackedOAuth("openai-codex", `ChatGPT Codex #${index}`, {
 				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginOpenAICodex({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshOpenAICodexToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			});
 		},
 	},
 
 	"github-copilot": {
 		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `GitHub Copilot #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGitHubCopilot({
-						onAuth: (url: string, instructions?: string) =>
-							callbacks.onAuth({ url, instructions }),
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						signal: callbacks.signal,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as CopilotCredentials;
-					return refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return flowBackedOAuth("github-copilot", `GitHub Copilot #${index}`);
 		},
 		buildModifyModels(providerName: string) {
 			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
 				const creds = credentials as CopilotCredentials;
-				const domain = creds.enterpriseUrl
-					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
-					: undefined;
-				const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
+				const baseUrl = getGitHubCopilotBaseUrl(creds.access, creds.enterpriseUrl);
 				return models.map((m) =>
 					m.provider === providerName ? { ...m, baseUrl } : m,
 				);
@@ -184,57 +278,21 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 
 	"google-gemini-cli": {
 		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `Google Cloud Code Assist #${index}`,
+			return flowBackedOAuth("google-gemini-cli", `Google Cloud Code Assist #${index}`, {
 				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGeminiCli(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshGoogleCloudToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
+			});
 		},
 	},
 
 	"google-antigravity": {
 		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `Antigravity #${index}`,
+			return flowBackedOAuth("google-antigravity", `Antigravity #${index}`, {
 				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshAntigravityToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
+			});
 		},
 	},
 };
@@ -968,9 +1026,18 @@ async function resolveGoogleQuotaAccess(
 	}
 
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		const credentials = account.baseProvider === "google-gemini-cli"
-			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
-			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
+		// pi-ai >= 0.84: use the built-in provider OAuth flow to refresh the
+		// access token instead of the removed refreshGoogleCloudToken helpers.
+		const flow = getBuiltinOAuthFlow(account.baseProvider);
+		const credentials = await flow.refresh(
+			asOAuthCredential({
+				access: auth.access ?? "",
+				refresh: auth.refresh,
+				expires: auth.expires ?? 0,
+				projectId,
+			}),
+			new AbortController().signal,
+		) as GeminiCredentials;
 		return {
 			accessToken: credentials.access,
 			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
@@ -1891,6 +1958,56 @@ function cloneModels(originalProvider: string, index: number) {
 	}));
 }
 
+/**
+ * Read the base provider's persisted remote-catalog overlay
+ * (~/.pi/agent/models-store.json). pi refreshes this file for builtin
+ * providers (pi.dev catalog, `pi update --models`, periodic re-checks);
+ * extension-registered providers never receive that overlay, so
+ * subscriptions mirror it from here.
+ */
+function storedOverlayModels(baseProvider: string): Model<Api>[] {
+	try {
+		const storePath = join(getAgentDir(), "models-store.json");
+		if (!existsSync(storePath)) return [];
+		const raw = JSON.parse(readFileSync(storePath, "utf8")) as Record<
+			string,
+			{ models?: unknown }
+		>;
+		const entry = raw[baseProvider];
+		if (!entry || !Array.isArray(entry.models)) return [];
+		return entry.models.filter(
+			(m): m is Model<Api> =>
+				!!m && typeof m === "object" && typeof (m as Model<Api>).id === "string",
+		);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Live model list for a subscription provider: the static builtin catalog
+ * merged with the base provider's persisted remote-catalog overlay (overlay
+ * entries win, mirroring pi's own catalog merge). Returned from
+ * `refreshModels` so catalog additions (e.g. gpt-6-astra) and metadata
+ * updates reach extra accounts on every model refresh cycle without a
+ * pi-multi-pass release.
+ */
+function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
+	const builtin = getModels(entry.provider as any) as Model<Api>[];
+	const overlay = storedOverlayModels(entry.provider);
+	const merged = [...builtin];
+	for (const model of overlay) {
+		const existing = merged.findIndex((m) => m.id === model.id);
+		if (existing >= 0) merged[existing] = model;
+		else merged.push(model);
+	}
+	return merged.map((m) => ({
+		...m,
+		provider: name,
+		name: `${m.name} (#${entry.index})`,
+	}));
+}
+
 // ==========================================================================
 // Register a single subscription as a provider
 // ==========================================================================
@@ -1906,11 +2023,14 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const baseUrl = builtinModels[0]?.baseUrl || "";
 	const models = cloneModels(entry.provider, entry.index);
 
+	// Static `models` is only the startup baseline; refreshModels swaps in the
+	// live merged catalog (builtin + remote overlay) on every refresh cycle.
 	pi.registerProvider(name, {
 		baseUrl,
 		api: builtinModels[0]?.api,
 		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
+		refreshModels: async () => liveSubscriptionModels(entry, name),
 	});
 }
 
