@@ -2135,6 +2135,21 @@ function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
 }
 
+const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+
+function parseHttpStatus(errorMessage: string): number | undefined {
+	const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
+	if (leading) return Number(leading[1]);
+	const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
+	return field ? Number(field[1]) : undefined;
+}
+
+function piWillRetryTurn(errorMessage: string): boolean {
+	const status = parseHttpStatus(errorMessage);
+	if (status === undefined) return true;
+	return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+}
+
 // ==========================================================================
 // Schedule evaluation helpers
 // ==========================================================================
@@ -2926,9 +2941,9 @@ class PoolManager {
 		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
 
-		if (lastUserPrompt) {
+		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
 			this.suppressNextStartTurn = true;
-			this.pi.sendUserMessage(lastUserPrompt);
+			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
 		}
 
 		return true;

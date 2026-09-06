@@ -99,6 +99,16 @@ function formatFailoverExhausted(poolName, currentProvider) {
   return `[pool:${poolName}] Failover exhausted after ${currentProvider}; no eligible target remained in this cascade.`;
 }
 
+const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+
+function piWillRetryTurn(errorMessage) {
+  const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
+  const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
+  const status = leading ? Number(leading[1]) : field ? Number(field[1]) : undefined;
+  if (status === undefined) return true;
+  return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+}
+
 class RuntimeHarness {
   constructor(config, authenticatedProviders) {
     this.config = config;
@@ -109,6 +119,7 @@ class RuntimeHarness {
     this.notifications = [];
     this.statuses = [];
     this.sentPrompts = [];
+    this.sentPromptOptions = [];
     this.setModelCalls = [];
     this.cascadeState = null;
     this.suppressNextStartTurn = false;
@@ -325,8 +336,9 @@ class RuntimeHarness {
     this.statuses.push(value);
   }
 
-  sendUserMessage(prompt) {
+  sendUserMessage(prompt, options) {
     this.sentPrompts.push(prompt);
+    this.sentPromptOptions.push(options);
   }
 
   async handleError(errorMessage, currentModel, prompt) {
@@ -381,9 +393,9 @@ class RuntimeHarness {
 
     this.notify(formatFailoverTransition(pool.name, currentModel.provider, nextCandidate), "info");
     this.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-    if (prompt) {
+    if (prompt && !piWillRetryTurn(errorMessage)) {
       this.suppressNextStartTurn = true;
-      this.sendUserMessage(prompt);
+      this.sendUserMessage(prompt, { deliverAs: "followUp" });
     }
     return true;
   }
@@ -394,6 +406,7 @@ class RuntimeHarness {
       visitedChainIndexes: [...(this.cascadeState?.visitedChainIndexes || [])],
       setModelCalls: [...this.setModelCalls],
       sentPrompts: [...this.sentPrompts],
+      sentPromptOptions: [...this.sentPromptOptions],
       notifications: [...this.notifications],
       statuses: [...this.statuses],
     };
@@ -502,7 +515,7 @@ async function runPoolOnlyChecks() {
 
   const snapshot = harness.snapshot();
   assert.deepEqual(snapshot.setModelCalls, ["anthropic-2:claude-sonnet-4"]);
-  assert.deepEqual(snapshot.sentPrompts, [prompt]);
+  assert.deepEqual(snapshot.sentPrompts, []);
   assert.equal(snapshot.statuses.at(-1), "pool:primary | active anthropic-2 (claude-sonnet-4)");
   assert.equal(
     snapshot.notifications.at(-1).message,
@@ -560,7 +573,7 @@ async function runNoLoopChecks() {
     "google-gemini-cli:gemini-2.5-pro",
   ]);
   assert.deepEqual(snapshot.visitedChainIndexes, [1, 2]);
-  assert.deepEqual(snapshot.sentPrompts, [prompt, prompt, prompt, prompt, prompt]);
+  assert.deepEqual(snapshot.sentPrompts, []);
 
   const warningMessages = snapshot.notifications
     .filter((entry) => entry.level === "warning")
@@ -681,6 +694,26 @@ function runSessionStatusChecks() {
   console.log("session-status checks passed");
 }
 
+async function runReplayDeliveryChecks() {
+  const config = createConfig();
+  const harness = new RuntimeHarness(config, ["anthropic", "anthropic-2"]);
+  const prompt = "finish the migration";
+
+  harness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
+  const rotated = await harness.handleError(
+    '400 {"error":{"message":"usage limit reached"}}',
+    { provider: "anthropic", id: "claude-sonnet-4" },
+    prompt,
+  );
+
+  assert.equal(rotated, true);
+  const snapshot = harness.snapshot();
+  assert.deepEqual(snapshot.sentPrompts, [prompt]);
+  assert.deepEqual(snapshot.sentPromptOptions, [{ deliverAs: "followUp" }]);
+
+  console.log("replay-delivery checks passed");
+}
+
 async function runRetryStartTurnChecks() {
   const config = createConfig();
   const harness = new RuntimeHarness(config, [
@@ -718,6 +751,7 @@ async function runRetryStartTurnChecks() {
 
 runCoreChecks();
 runSessionStatusChecks();
+await runReplayDeliveryChecks();
 
 if (process.argv.includes("--retry-start-turn")) {
   await runRetryStartTurnChecks();
