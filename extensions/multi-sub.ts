@@ -64,6 +64,18 @@ import {
 } from "@earendil-works/pi-ai/providers/all";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/oauth";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { registerApiProvider } from "@earendil-works/pi-ai/compat";
+import {
+	getApiKey as getAntigravityApiKey,
+	loginAntigravity,
+	refreshAntigravityToken,
+} from "../../../../../npm/node_modules/pi-antigravity/src/auth/index.js";
+import { DEFAULT_ENDPOINT as ANTIGRAVITY_ENDPOINT } from "../../../../../npm/node_modules/pi-antigravity/src/client/index.js";
+import {
+	getCurrentAntigravityCatalog,
+	refreshAntigravityModels,
+} from "../../../../../npm/node_modules/pi-antigravity/src/models/index.js";
+import { ANTIGRAVITY_API, streamAntigravity } from "../../../../../npm/node_modules/pi-antigravity/src/stream/index.js";
 import {
 	Container,
 	Key,
@@ -302,13 +314,31 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		},
 	},
 
-	"google-antigravity": {
+	antigravity: {
 		displayName: "Antigravity",
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return flowBackedOAuth("google-antigravity", `Antigravity #${index}`, {
+			return {
+				name: `Antigravity #${index}`,
 				usesCallbackServer: true,
-			});
+				login: loginAntigravity,
+				refreshToken: refreshAntigravityToken,
+				getApiKey: getAntigravityApiKey,
+			};
+		},
+	},
+
+	"google-antigravity": {
+		displayName: "Antigravity (legacy alias; use antigravity)",
+		usesCallbackServer: true,
+		buildOAuth(index: number) {
+			return {
+				name: `Antigravity #${index}`,
+				usesCallbackServer: true,
+				login: loginAntigravity,
+				refreshToken: refreshAntigravityToken,
+				getApiKey: getAntigravityApiKey,
+			};
 		},
 	},
 
@@ -482,7 +512,9 @@ function getCodexTokenMetadata(accessToken: string): {
 	const payload = decodeJwtPayload(accessToken);
 	const auth = getRecord(payload[OPENAI_AUTH_CLAIM]);
 	const profile = getRecord(payload[OPENAI_PROFILE_CLAIM]);
-	const accountId = typeof auth?.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined;
+	const accountId = (typeof auth?.chatgpt_account_id === "string" && auth.chatgpt_account_id.length > 0)
+		? auth.chatgpt_account_id
+		: (typeof auth?.user_id === "string" ? auth.user_id : undefined);
 	const planType = typeof auth?.chatgpt_plan_type === "string" ? auth.chatgpt_plan_type : undefined;
 	const email = typeof profile?.email === "string" ? profile.email : undefined;
 	return { accountId, planType, email };
@@ -2099,6 +2131,24 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 
 	const name = subProviderName(entry);
 	const oauth = template.buildOAuth?.(entry.index);
+
+	if (entry.provider === "antigravity" || entry.provider === "google-antigravity") {
+		const models = getCurrentAntigravityCatalog().models.map((m) => ({
+			...m,
+			name: `${m.name || m.id} (#${entry.index})`,
+		}));
+		pi.registerProvider(name, {
+			name: `Antigravity #${entry.index}`,
+			baseUrl: ANTIGRAVITY_ENDPOINT,
+			api: ANTIGRAVITY_API,
+			oauth,
+			models,
+			refreshModels: refreshAntigravityModels,
+			streamSimple: streamAntigravity,
+		});
+		return;
+	}
+
 	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
@@ -2129,13 +2179,73 @@ const RATE_LIMIT_PATTERNS = [
 	/capacity/i,
 	/429/,
 	/quota/i,
+	/out of budget/i,
+	/insufficient_quota/i,
+	/billing/i,
+	/GoUsageLimitError/i,
+	/FreeUsageLimitError/i,
+	/available balance/i,
+	/ResourceExhausted/i,
 ];
 
 function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
 }
 
+const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS = [
+	/usage.?limit/i,
+	/limit.*reached/i,
+	/quota/i,
+	/out of budget/i,
+	/billing/i,
+	/GoUsageLimitError/i,
+	/FreeUsageLimitError/i,
+	/Monthly usage limit reached/i,
+	/available balance/i,
+	/insufficient_quota/i,
+];
+
 const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+
+const RETRYABLE_PROVIDER_PATTERNS = [
+	/overloaded/i,
+	/rate.?limit/i,
+	/too many requests/i,
+	/\b429\b/,
+	/\b500\b/,
+	/\b502\b/,
+	/\b503\b/,
+	/\b504\b/,
+	/\b524\b/,
+	/service.?unavailable/i,
+	/server.?error/i,
+	/internal.?error/i,
+	/provider.?returned.?error/i,
+	/exceeded request buffer limit while retrying upstream/i,
+	/network.?error/i,
+	/connection.?error/i,
+	/connection.?refused/i,
+	/connection.?lost/i,
+	/other side closed/i,
+	/fetch failed/i,
+	/socket hang up/i,
+	/timed? out/i,
+	/timeout/i,
+	/terminated/i,
+	/ResourceExhausted/i,
+];
+
+function isPiRetryEnabled(): boolean {
+	try {
+		const settingsPath = join(getAgentDir(), "settings.json");
+		if (existsSync(settingsPath)) {
+			const content = readFileSync(settingsPath, "utf-8");
+			const settings = JSON.parse(content);
+			if (settings.retry?.enabled === false) return false;
+		}
+	} catch {}
+	return true;
+}
 
 function parseHttpStatus(errorMessage: string): number | undefined {
 	const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
@@ -2145,9 +2255,19 @@ function parseHttpStatus(errorMessage: string): number | undefined {
 }
 
 function piWillRetryTurn(errorMessage: string): boolean {
+	if (!isPiRetryEnabled()) return false;
+
+	// Non-retryable account/usage/quota limits will never be retried by Pi
+	if (NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS.some((p) => p.test(errorMessage))) {
+		return false;
+	}
+
 	const status = parseHttpStatus(errorMessage);
-	if (status === undefined) return true;
-	return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+	if (status !== undefined && (status >= 500 || PI_RETRYABLE_STATUSES.has(status))) {
+		return true;
+	}
+
+	return RETRYABLE_PROVIDER_PATTERNS.some((p) => p.test(errorMessage));
 }
 
 // ==========================================================================
@@ -3007,14 +3127,13 @@ class PoolManager {
 			: `pool ${nextCandidate.poolName} (${pool.strategy || "round-robin"})`;
 		this.recordTrace(`selected ${nextCandidate.provider} (${nextCandidate.modelId}) via ${route}`);
 
-		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
+		const promptToReplay = lastUserPrompt?.trim() ? lastUserPrompt : "continue";
+		if (!piWillRetryTurn(errorMessage)) {
 			this.suppressNextStartTurn = true;
-			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
+			this.pi.sendUserMessage(promptToReplay, { deliverAs: "followUp" });
 			this.recordTrace("queued follow-up because pi will not retry this error");
-		} else if (piWillRetryTurn(errorMessage)) {
-			this.recordTrace("waiting for pi to retry the turn");
 		} else {
-			this.recordTrace("turn cannot be replayed because no prompt was captured");
+			this.recordTrace("waiting for pi to retry the turn");
 		}
 
 		return true;
@@ -5741,6 +5860,12 @@ async function handlePresetMenu(
 // ==========================================================================
 
 export default function multiSub(pi: ExtensionAPI) {
+	registerApiProvider({
+		api: ANTIGRAVITY_API,
+		stream: streamAntigravity,
+		streamSimple: streamAntigravity,
+	});
+
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
@@ -5858,12 +5983,32 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (assistantMsg.stopReason !== "error") return;
 		if (!assistantMsg.errorMessage) return;
 
+		// If lastUserPrompt was not captured via before_agent_start, extract it from transcript messages
+		let promptForRotation = lastUserPrompt;
+		if (!promptForRotation) {
+			for (let i = event.messages.length - 1; i >= 0; i--) {
+				const m = event.messages[i];
+				if (m.role === "user") {
+					if (typeof m.content === "string" && m.content.trim()) {
+						promptForRotation = m.content;
+						break;
+					} else if (Array.isArray(m.content)) {
+						const textPart = m.content.find((c: any) => c.type === "text") as any;
+						if (textPart?.text && textPart.text.trim()) {
+							promptForRotation = textPart.text;
+							break;
+						}
+					}
+				}
+			}
+		}
+
 		const effective = loadEffectiveConfig(ctx.cwd);
 		const rotated = await poolManager.handleError(
 			assistantMsg.errorMessage,
 			ctx.model,
 			ctx,
-			lastUserPrompt,
+			promptForRotation,
 			normalizeMultiPassConfig({
 				subscriptions: effective.subscriptions,
 				pools: effective.pools,

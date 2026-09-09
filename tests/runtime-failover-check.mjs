@@ -99,14 +99,63 @@ function formatFailoverExhausted(poolName, currentProvider) {
   return `[pool:${poolName}] Failover exhausted after ${currentProvider}; no eligible target remained in this cascade.`;
 }
 
+const NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS = [
+  /usage.?limit/i,
+  /limit.*reached/i,
+  /quota/i,
+  /out of budget/i,
+  /billing/i,
+  /GoUsageLimitError/i,
+  /FreeUsageLimitError/i,
+  /Monthly usage limit reached/i,
+  /available balance/i,
+  /insufficient_quota/i,
+];
+
 const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
 
-function piWillRetryTurn(errorMessage) {
+const RETRYABLE_PROVIDER_PATTERNS = [
+  /overloaded/i,
+  /rate.?limit/i,
+  /too many requests/i,
+  /\b429\b/,
+  /\b500\b/,
+  /\b502\b/,
+  /\b503\b/,
+  /\b504\b/,
+  /\b524\b/,
+  /service.?unavailable/i,
+  /server.?error/i,
+  /internal.?error/i,
+  /provider.?returned.?error/i,
+  /exceeded request buffer limit while retrying upstream/i,
+  /network.?error/i,
+  /connection.?error/i,
+  /connection.?refused/i,
+  /connection.?lost/i,
+  /other side closed/i,
+  /fetch failed/i,
+  /socket hang up/i,
+  /timed? out/i,
+  /timeout/i,
+  /terminated/i,
+  /ResourceExhausted/i,
+];
+
+function piWillRetryTurn(errorMessage, retrySettings = { enabled: true }) {
+  if (!retrySettings.enabled) return false;
+
+  if (NON_RETRYABLE_PROVIDER_LIMIT_PATTERNS.some((p) => p.test(errorMessage))) {
+    return false;
+  }
+
   const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
   const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
   const status = leading ? Number(leading[1]) : field ? Number(field[1]) : undefined;
-  if (status === undefined) return true;
-  return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+  if (status !== undefined && (status >= 500 || PI_RETRYABLE_STATUSES.has(status))) {
+    return true;
+  }
+  return RETRYABLE_PROVIDER_PATTERNS.some((p) => p.test(errorMessage));
 }
 
 class RuntimeHarness {
@@ -393,9 +442,10 @@ class RuntimeHarness {
 
     this.notify(formatFailoverTransition(pool.name, currentModel.provider, nextCandidate), "info");
     this.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-    if (prompt && !piWillRetryTurn(errorMessage)) {
+    const promptToReplay = prompt?.trim() ? prompt : "continue";
+    if (!piWillRetryTurn(errorMessage)) {
       this.suppressNextStartTurn = true;
-      this.sendUserMessage(prompt, { deliverAs: "followUp" });
+      this.sendUserMessage(promptToReplay, { deliverAs: "followUp" });
     }
     return true;
   }
@@ -710,6 +760,51 @@ async function runReplayDeliveryChecks() {
   const snapshot = harness.snapshot();
   assert.deepEqual(snapshot.sentPrompts, [prompt]);
   assert.deepEqual(snapshot.sentPromptOptions, [{ deliverAs: "followUp" }]);
+
+  // Test Codex usage limit without HTTP status code
+  const harnessCodex = new RuntimeHarness(config, ["openai-codex", "openai-codex-2"]);
+  harnessCodex.startTurn(prompt, { provider: "openai-codex", id: "gpt-5-mini" });
+  const rotatedCodex = await harnessCodex.handleError(
+    "Codex error: The usage limit has been reached",
+    { provider: "openai-codex", id: "gpt-5-mini" },
+    prompt,
+  );
+  assert.equal(rotatedCodex, true);
+  assert.deepEqual(harnessCodex.snapshot().sentPrompts, [prompt]);
+  assert.deepEqual(harnessCodex.snapshot().sentPromptOptions, [{ deliverAs: "followUp" }]);
+
+  // Test Antigravity quota reset message without HTTP status code
+  const harnessQuota = new RuntimeHarness(config, ["openai-codex", "openai-codex-2"]);
+  harnessQuota.startTurn(prompt, { provider: "openai-codex", id: "gpt-5-mini" });
+  const rotatedQuota = await harnessQuota.handleError(
+    "Quota reached. Please wait 4h 12m for reset. Next: switch models or try again after reset.",
+    { provider: "openai-codex", id: "gpt-5-mini" },
+    prompt,
+  );
+  assert.equal(rotatedQuota, true);
+  assert.deepEqual(harnessQuota.snapshot().sentPrompts, [prompt]);
+
+  // Test 429 quota error (which Pi classifies as non-retryable)
+  const harness429Quota = new RuntimeHarness(config, ["openai-codex", "openai-codex-2"]);
+  harness429Quota.startTurn(prompt, { provider: "openai-codex", id: "gpt-5-mini" });
+  const rotated429 = await harness429Quota.handleError(
+    "429 You exceeded your current quota, please check your plan and billing details.",
+    { provider: "openai-codex", id: "gpt-5-mini" },
+    prompt,
+  );
+  assert.equal(rotated429, true);
+  assert.deepEqual(harness429Quota.snapshot().sentPrompts, [prompt]);
+
+  // Test null prompt falls back to "continue"
+  const harnessNull = new RuntimeHarness(config, ["openai-codex", "openai-codex-2"]);
+  harnessNull.startTurn(null, { provider: "openai-codex", id: "gpt-5-mini" });
+  const rotatedNull = await harnessNull.handleError(
+    "Codex error: The usage limit has been reached",
+    { provider: "openai-codex", id: "gpt-5-mini" },
+    null,
+  );
+  assert.equal(rotatedNull, true);
+  assert.deepEqual(harnessNull.snapshot().sentPrompts, ["continue"]);
 
   console.log("replay-delivery checks passed");
 }
