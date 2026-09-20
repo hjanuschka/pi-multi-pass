@@ -57,7 +57,7 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs              Open menu
 /subs add          Add a new subscription
 /subs remove       Remove a subscription
-/subs login        Login to a subscription
+/subs login        Login or re-authenticate a subscription
 /subs logout       Logout from a subscription
 /subs switch       Manually switch to a subscription/provider now
 /subs list         List subscriptions with auth status; select one for quick actions

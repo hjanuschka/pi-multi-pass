@@ -2131,8 +2131,20 @@ const RATE_LIMIT_PATTERNS = [
 	/quota/i,
 ];
 
+const TERMINAL_OAUTH_REFRESH_PATTERNS = [
+	/invalid[_\s-]?refresh[_\s-]?token/i,
+	/refresh token.*(?:invalid|expired|revoked)/i,
+	/(?:invalid|expired|revoked).*refresh token/i,
+];
+
+const providersRequiringReauthentication = new Set<string>();
+
 function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
+}
+
+function isTerminalOAuthRefreshError(errorMessage: string): boolean {
+	return TERMINAL_OAUTH_REFRESH_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
 const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
@@ -3048,7 +3060,11 @@ function formatSubscriptionMeta(
 ): string {
 	const name = subProviderName(entry);
 	const hasAuth = authStorage.hasAuth(name);
-	const status = hasAuth ? "[logged in]" : "[not logged in]";
+	const status = providersRequiringReauthentication.has(name)
+		? "[reauthentication required]"
+		: hasAuth
+			? "[logged in]"
+			: "[not logged in]";
 	const source = getSubscriptionSource(config, entry);
 	return `${status} (${source})`;
 }
@@ -3223,6 +3239,7 @@ async function removeSubscriptionEntry(
 	if (getAuthStorage(ctx).hasAuth(name)) {
 		await getAuthStorage(ctx).logout(name);
 	}
+	providersRequiringReauthentication.delete(name);
 	pi.unregisterProvider(name);
 
 	for (const pool of config.pools) {
@@ -3271,9 +3288,21 @@ async function showSubscriptionActions(
 	}
 
 	const name = subProviderName(entry);
-	const hasAuth = getAuthStorage(ctx).hasAuth(name);
+	const authStorage = getAuthStorage(ctx);
+	const hasAuth = authStorage.hasAuth(name);
+	const auth = authStorage.get(name);
+	const needsReauthentication = providersRequiringReauthentication.has(name);
 	const actionItems: SelectItem[] = [
 		{ value: "rename", label: "rename", description: "Change friendly label" },
+		...(hasAuth && auth?.type === "oauth"
+			? [{
+				value: "reauthenticate",
+				label: "re-authenticate",
+				description: needsReauthentication
+					? "Replace the rejected OAuth credential"
+					: "Replace the saved OAuth credential",
+			}]
+			: []),
 		hasAuth
 			? { value: "logout", label: "logout", description: "Log out this subscription" }
 			: { value: "login", label: "login", description: "Show login instructions" },
@@ -3299,8 +3328,23 @@ async function showSubscriptionActions(
 		);
 		return;
 	}
+	if (action === "reauthenticate") {
+		const confirmed = await ctx.ui.confirm(
+			`Re-authenticate ${subDisplayName(entry)}`,
+			"The saved OAuth credential will be removed before starting a new login. Continue?",
+		);
+		if (!confirmed) return;
+		await authStorage.logout(name);
+		providersRequiringReauthentication.delete(name);
+		ctx.ui.notify(
+			`Credential cleared. Use /login and select "${subscriptionLoginName(entry)}" to authenticate again.`,
+			"info",
+		);
+		return;
+	}
 	if (action === "logout") {
-		await getAuthStorage(ctx).logout(name);
+		await authStorage.logout(name);
+		providersRequiringReauthentication.delete(name);
 		ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 		return;
 	}
@@ -3444,16 +3488,17 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
+	const authStorage = getAuthStorage(ctx);
+	const loginCandidates = all.filter((entry) => {
+		const name = subProviderName(entry);
+		return !authStorage.hasAuth(name) || authStorage.get(name)?.type === "oauth";
+	});
 
-	const notLoggedIn = all.filter(
-		(entry) => !getAuthStorage(ctx).hasAuth(subProviderName(entry)),
-	);
-
-	if (notLoggedIn.length === 0) {
+	if (loginCandidates.length === 0) {
 		ctx.ui.notify(
 			all.length === 0
 				? "No subscriptions configured. Use /subs add first."
-				: "All subscriptions are already logged in.",
+				: "All subscriptions use API keys and are already configured.",
 			"info",
 		);
 		return;
@@ -3461,20 +3506,40 @@ async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
 
 	const selectedProviderName = await showWrappedSelect(ctx, {
 		title: "Login to subscription",
-		subtitle: "Select a subscription to see login instructions.",
+		subtitle: "Logged-in OAuth subscriptions can be re-authenticated.",
 		initialValue: ctx.model?.provider,
-		items: notLoggedIn.map((entry) => ({
-			value: subProviderName(entry),
-			label: subDisplayName(entry),
-			description: "not logged in",
-		})),
+		items: loginCandidates.map((entry) => {
+			const name = subProviderName(entry);
+			const hasAuth = authStorage.hasAuth(name);
+			return {
+				value: name,
+				label: subDisplayName(entry),
+				description: providersRequiringReauthentication.has(name)
+					? "reauthentication required"
+					: hasAuth
+						? "logged in; re-authenticate"
+						: "not logged in",
+			};
+		}),
 		confirmHint: "open",
 		cancelHint: "back",
 	});
 	if (!selectedProviderName) return;
 
-	const entry = notLoggedIn.find((candidate) => subProviderName(candidate) === selectedProviderName);
+	const entry = loginCandidates.find(
+		(candidate) => subProviderName(candidate) === selectedProviderName,
+	);
 	if (!entry) return;
+
+	if (authStorage.hasAuth(selectedProviderName)) {
+		const confirmed = await ctx.ui.confirm(
+			`Re-authenticate ${subDisplayName(entry)}`,
+			"The saved OAuth credential will be removed before starting a new login. Continue?",
+		);
+		if (!confirmed) return;
+		await authStorage.logout(selectedProviderName);
+		providersRequiringReauthentication.delete(selectedProviderName);
+	}
 
 	ctx.ui.notify(
 		`Use /login and select "${subscriptionLoginName(entry)}" to authenticate.`,
@@ -3514,6 +3579,7 @@ async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
 	if (!entry) return;
 
 	await getAuthStorage(ctx).logout(subProviderName(entry));
+	providersRequiringReauthentication.delete(subProviderName(entry));
 	ctx.ui.notify(`Logged out of ${subDisplayName(entry)}`, "info");
 }
 
@@ -3534,7 +3600,9 @@ async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
 		const hasAuth = getAuthStorage(ctx).hasAuth(name);
 
 		let status: string;
-		if (!hasAuth) {
+		if (providersRequiringReauthentication.has(name)) {
+			status = "reauthentication required (use /subs login)";
+		} else if (!hasAuth) {
 			status = "not logged in";
 		} else if (cred?.type === "oauth") {
 			const expiresIn = typeof cred.expires === "number" ? cred.expires - Date.now() : 0;
@@ -5855,10 +5923,27 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (!lastMsg || lastMsg.role !== "assistant") return;
 
 		const assistantMsg = lastMsg as any;
-		if (assistantMsg.stopReason !== "error") return;
+		const providerName = ctx.model?.provider;
+		if (assistantMsg.stopReason !== "error") {
+			if (providerName) providersRequiringReauthentication.delete(providerName);
+			return;
+		}
 		if (!assistantMsg.errorMessage) return;
 
 		const effective = loadEffectiveConfig(ctx.cwd);
+		if (
+			providerName &&
+			isTerminalOAuthRefreshError(assistantMsg.errorMessage) &&
+			effective.subscriptions.some((entry) => subProviderName(entry) === providerName) &&
+			getAuthStorage(ctx).get(providerName)?.type === "oauth"
+		) {
+			providersRequiringReauthentication.add(providerName);
+			ctx.ui.notify(
+				`${getProviderDisplayName(providerName, effective.subscriptions)} needs reauthentication. Run /subs login to replace the rejected credential.`,
+				"warning",
+			);
+		}
+
 		const rotated = await poolManager.handleError(
 			assistantMsg.errorMessage,
 			ctx.model,
