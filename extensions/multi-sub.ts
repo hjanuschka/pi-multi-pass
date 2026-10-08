@@ -5557,8 +5557,8 @@ async function handlePresetCreate(
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
 	const allProviders: string[] = [];
-	for (const provider of SUPPORTED_PROVIDERS) {
-		allProviders.push(provider);
+	for (const provider of builtinProviders()) {
+		allProviders.push(provider.id);
 	}
 	for (const entry of allSubs) {
 		allProviders.push(subProviderName(entry));
