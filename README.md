@@ -1,6 +1,6 @@
 # pi-multi-pass
 
-Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+Multi-subscription extension for [pi](https://github.com/earendil-works/pi) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 
 ## Install
 
