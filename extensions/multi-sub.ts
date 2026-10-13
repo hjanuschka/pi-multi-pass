@@ -43,6 +43,7 @@ import {
 	unlinkSync,
 	writeFileSync,
 } from "fs";
+import { homedir } from "os";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
 import type {
@@ -3940,6 +3941,122 @@ async function resolveAccountEmails(
 	}));
 }
 
+interface SubsDashboardItem {
+	value: string;
+	glyph: string;
+	name: string;
+	statusColor: "success" | "warning" | "dim";
+	statusGlyph: string;
+	detail: string;
+	meta?: string;
+	active?: boolean;
+}
+
+interface SubsDashboardSection {
+	heading: string;
+	items: SubsDashboardItem[];
+}
+
+/** Sectioned account picker with non-selectable headings. SelectList does
+ * not support decoration rows, so this renders its own list: section
+ * headings, aligned columns, status dots, and an active-provider marker. */
+async function showSubsDashboard(
+	ctx: ExtensionCommandContext,
+	sections: SubsDashboardSection[],
+	initialValue?: string,
+): Promise<string | undefined> {
+	const visibleSections = sections.filter((section) => section.items.length > 0);
+	const flat = visibleSections.flatMap((section) => section.items);
+	if (flat.length === 0) return undefined;
+
+	if (!ctx.hasUI) {
+		const rendered = flat.map((item) =>
+			[item.name, item.detail, item.meta].filter(Boolean).join(" -- "),
+		);
+		const selected = await ctx.ui.select("Subscriptions", rendered);
+		if (!selected) return undefined;
+		const index = rendered.indexOf(selected);
+		return index >= 0 ? flat[index]?.value : undefined;
+	}
+
+	const result = await ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+		let selectedIndex = Math.max(
+			0,
+			flat.findIndex((item) => item.value === initialValue),
+		);
+		const nameWidth = Math.min(
+			38,
+			Math.max(...flat.map((item) => visibleWidth(item.name))),
+		);
+		const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+		const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+		const footer = [
+			keyHint("tui.select.confirm", "open"),
+			keyHint("tui.select.cancel", "close"),
+		].join(" \u2022 ");
+
+		const padName = (name: string): string => {
+			const truncated = truncateToWidth(name, nameWidth);
+			return truncated + " ".repeat(Math.max(0, nameWidth - visibleWidth(truncated)));
+		};
+
+		return {
+			render(width: number): string[] {
+				const lines: string[] = [];
+				const push = (line: string) => lines.push(truncateToWidth(line, width));
+				lines.push(...topBorder.render(width));
+				push(theme.fg("accent", theme.bold(" \u2726 multi-pass \u00b7 subscriptions")));
+				for (const section of visibleSections) {
+					push("");
+					push(theme.fg("muted", theme.bold(` ${section.heading.toUpperCase()}`)));
+					for (const item of section.items) {
+						const index = flat.indexOf(item);
+						const isSelected = index === selectedIndex;
+						const prefix = isSelected ? theme.fg("accent", " \u2192 ") : "   ";
+						const glyph = theme.fg(item.statusColor, item.glyph);
+						const name = isSelected
+							? theme.fg("accent", theme.bold(padName(item.name)))
+							: padName(item.name);
+						const status = theme.fg(item.statusColor, item.statusGlyph);
+						const detail = theme.fg("muted", item.detail);
+						const meta = item.meta ? theme.fg("dim", `  \u00b7 ${item.meta}`) : "";
+						const active = item.active ? theme.fg("accent", "  \u2726 active") : "";
+						push(`${prefix}${glyph} ${name}  ${status} ${detail}${meta}${active}`);
+					}
+				}
+				push("");
+				push(theme.fg("dim", ` ${footer}`));
+				lines.push(...bottomBorder.render(width));
+				return lines;
+			},
+			invalidate() {
+				topBorder.invalidate?.();
+				bottomBorder.invalidate?.();
+			},
+			handleInput(data: string) {
+				if (matchesKey(data, Key.up)) {
+					selectedIndex = (selectedIndex - 1 + flat.length) % flat.length;
+					tui.requestRender();
+					return;
+				}
+				if (matchesKey(data, Key.down)) {
+					selectedIndex = (selectedIndex + 1) % flat.length;
+					tui.requestRender();
+					return;
+				}
+				if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+					done(flat[selectedIndex]?.value ?? null);
+					return;
+				}
+				if (matchesKey(data, Key.escape)) {
+					done(null);
+				}
+			},
+		};
+	});
+	return result ?? undefined;
+}
+
 async function showBuiltinProviderInfo(
 	ctx: ExtensionCommandContext,
 	provider: string,
@@ -3981,41 +4098,53 @@ async function handleSubsList(
 			authStorage,
 		);
 
-		const builtinItems: SelectItem[] = [];
-		for (const provider of builtinProviderNames) {
+		const builtinItems: SubsDashboardItem[] = builtinProviderNames.map((provider) => {
 			const email = getStoredAccountEmail(provider, authStorage);
-			builtinItems.push({
+			return {
 				value: `builtin:${provider}`,
-				label: PROVIDER_TEMPLATES[provider]?.displayName || provider,
-				description: ["[built-in]", "[logged in]", email].filter(Boolean).join(" "),
-			});
-		}
+				glyph: STATUS_BAR_GLYPHS[provider] || "\u25cf",
+				name: PROVIDER_TEMPLATES[provider]?.displayName || provider,
+				statusColor: "success" as const,
+				statusGlyph: "\u25cf",
+				detail: email || "logged in",
+				active: ctx.model?.provider === provider,
+			};
+		});
 
 		if (all.length === 0 && builtinItems.length === 0) {
 			ctx.ui.notify("No extra subscriptions configured. Use /subs add to create one.", "info");
 			return;
 		}
 
-		const subItems: SelectItem[] = all.map((entry) => {
+		const subItems: SubsDashboardItem[] = all.map((entry) => {
 			const name = subProviderName(entry);
 			const email = getStoredAccountEmail(name, authStorage);
+			const needsReauth = providersRequiringReauthentication.has(name);
+			const loggedIn = authStorage.hasAuth(name);
 			return {
 				value: name,
-				label: subDisplayName(entry),
-				description: [formatSubscriptionMeta(entry, config, authStorage), email]
-					.filter(Boolean)
-					.join(" "),
+				glyph: STATUS_BAR_GLYPHS[entry.provider] || "\u25cf",
+				name: subDisplayName(entry),
+				statusColor: needsReauth ? "warning" as const : loggedIn ? "success" as const : "dim" as const,
+				statusGlyph: needsReauth ? "\u27f3" : loggedIn ? "\u25cf" : "\u25cb",
+				detail: needsReauth
+					? "reauth required"
+					: loggedIn
+						? email || "logged in"
+						: "not logged in",
+				meta: getSubscriptionSource(config, entry),
+				active: ctx.model?.provider === name,
 			};
 		});
 
-		const selectedProviderName = await showWrappedSelect(ctx, {
-			title: "Subscriptions",
-			subtitle: "Built-in logins are listed first with their account email.",
-			items: [...builtinItems, ...subItems],
-			initialValue: preferredProviderName,
-			confirmHint: "open",
-			cancelHint: "close",
-		});
+		const selectedProviderName = await showSubsDashboard(
+			ctx,
+			[
+				{ heading: "built-in", items: builtinItems },
+				{ heading: "multi-pass", items: subItems },
+			],
+			preferredProviderName,
+		);
 		if (!selectedProviderName) return;
 
 		preferredProviderName = selectedProviderName;
@@ -6533,6 +6662,15 @@ function refreshStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void 
 		});
 }
 
+function shortenPathForStatusBar(path: string): string {
+	const home = homedir();
+	let shortened = home && path.startsWith(home) ? `~${path.slice(home.length)}` : path;
+	if (shortened.length > 28) {
+		shortened = `\u2026${shortened.slice(-27)}`;
+	}
+	return shortened;
+}
+
 function renderStatusBarLine(
 	theme: Theme,
 	footerData: ReadonlyFooterDataProvider,
@@ -6564,6 +6702,7 @@ function renderStatusBarLine(
 	const now = new Date();
 	const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 	const rightParts: string[] = [];
+	rightParts.push(shortenPathForStatusBar(ctx.cwd));
 	if (ctx.model) rightParts.push(ctx.model.id);
 	const usage = ctx.getContextUsage();
 	if (usage?.percent != null) rightParts.push(`ctx ${Math.round(usage.percent)}%`);
@@ -6606,7 +6745,16 @@ function createStatusBarComponent(
 		},
 		invalidate() {},
 		render(width: number): string[] {
-			return [renderStatusBarLine(theme, footerData, ctx, width)];
+			const lines = [renderStatusBarLine(theme, footerData, ctx, width)];
+			// Keep texts other extensions publish via ctx.ui.setStatus() visible;
+			// replacing the footer must not swallow them.
+			const statuses = [...footerData.getExtensionStatuses().values()]
+				.map((status) => status.trim())
+				.filter(Boolean);
+			if (statuses.length > 0) {
+				lines.push(truncateToWidth(statuses.join(theme.fg("dim", " \u2502 ")), width));
+			}
+			return lines;
 		},
 	};
 }
