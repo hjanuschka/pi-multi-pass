@@ -50,6 +50,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
+	ReadonlyFooterDataProvider,
 } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
@@ -72,7 +73,10 @@ import {
 	Spacer,
 	Text,
 	matchesKey,
+	truncateToWidth,
+	visibleWidth,
 	type SelectItem,
+	type TUI,
 } from "@earendil-works/pi-tui";
 
 // ==========================================================================
@@ -2176,6 +2180,8 @@ interface MultiPassConfig {
 	pools: PoolConfig[];
 	chains: ChainConfig[];
 	presets: PresetConfig[];
+	/** Omarchy-style footer status bar. Off by default; toggled with /subs statusbar. */
+	statusBar?: boolean;
 }
 
 /** Project-level config (.pi/multi-pass.json) */
@@ -2221,6 +2227,7 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 		pools: Array.isArray(parsed.pools) ? parsed.pools : [],
 		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
 		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
+		statusBar: parsed.statusBar === true,
 	};
 }
 
@@ -3872,6 +3879,57 @@ async function showSubscriptionActions(
 	}
 }
 
+/** Best-effort account email from a stored credential, without network
+ * calls: JWT claims on the access/id token, a stored email field, or a
+ * cached quota result from /subs limits or the status bar. */
+function extractEmailFromJwt(token: string | undefined): string | undefined {
+	if (!token || token.split(".").length < 3) return undefined;
+	const payload = decodeJwtPayload(token);
+	if (typeof payload.email === "string") return payload.email;
+	const profile = getRecord(payload[OPENAI_PROFILE_CLAIM]);
+	if (profile && typeof profile.email === "string") return profile.email;
+	return undefined;
+}
+
+function getStoredAccountEmail(
+	providerName: string,
+	authStorage: AuthStorageCompat,
+): string | undefined {
+	const auth = authStorage.get(providerName);
+	if (!auth) return undefined;
+	if (typeof auth.email === "string" && auth.email) return auth.email;
+	const idToken = typeof auth.idToken === "string"
+		? auth.idToken
+		: typeof auth.id_token === "string"
+			? auth.id_token
+			: undefined;
+	return (
+		extractEmailFromJwt(typeof auth.access === "string" ? auth.access : undefined) ??
+		extractEmailFromJwt(idToken) ??
+		statusBarQuota.get(providerName)?.email
+	);
+}
+
+async function showBuiltinProviderInfo(
+	ctx: ExtensionCommandContext,
+	provider: string,
+): Promise<void> {
+	const email = getStoredAccountEmail(provider, getAuthStorage(ctx));
+	const lines = [
+		`provider: ${provider}`,
+		email ? `email: ${email}` : "email: unknown (run /subs limits to fetch)",
+		"source: built-in pi provider",
+		"manage: /login and /logout handle this credential",
+	];
+	await showWrappedSelect(ctx, {
+		title: `${PROVIDER_TEMPLATES[provider]?.displayName || provider} (built-in)`,
+		subtitle: "Built-in provider credential. Press Escape to go back.",
+		items: lines.map((line, index) => ({ value: String(index), label: line })),
+		confirmHint: "back",
+		cancelHint: "back",
+	});
+}
+
 async function handleSubsList(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -3883,20 +3941,40 @@ async function handleSubsList(
 	while (true) {
 		const envEntries = parseEnvConfig();
 		const all = normalizeEntries(mergeConfigs(config, envEntries));
+		const authStorage = getAuthStorage(ctx);
 
-		if (all.length === 0) {
+		const builtinItems: SelectItem[] = [];
+		for (const provider of SUPPORTED_PROVIDERS) {
+			if (!authStorage.hasAuth(provider)) continue;
+			const email = getStoredAccountEmail(provider, authStorage);
+			builtinItems.push({
+				value: `builtin:${provider}`,
+				label: `${PROVIDER_TEMPLATES[provider]?.displayName || provider} (built-in)`,
+				description: email ? `[logged in] ${email}` : "[logged in]",
+			});
+		}
+
+		if (all.length === 0 && builtinItems.length === 0) {
 			ctx.ui.notify("No extra subscriptions configured. Use /subs add to create one.", "info");
 			return;
 		}
 
-		const selectedProviderName = await showWrappedSelect(ctx, {
-			title: "Extra Subscriptions",
-			subtitle: "Select a subscription for quick actions.",
-			items: all.map((entry) => ({
-				value: subProviderName(entry),
+		const subItems: SelectItem[] = all.map((entry) => {
+			const name = subProviderName(entry);
+			const email = getStoredAccountEmail(name, authStorage);
+			return {
+				value: name,
 				label: subDisplayName(entry),
-				description: formatSubscriptionMeta(entry, config, getAuthStorage(ctx)),
-			})),
+				description: [formatSubscriptionMeta(entry, config, authStorage), email]
+					.filter(Boolean)
+					.join(" "),
+			};
+		});
+
+		const selectedProviderName = await showWrappedSelect(ctx, {
+			title: "Subscriptions",
+			subtitle: "Built-in logins are listed first with their account email.",
+			items: [...builtinItems, ...subItems],
 			initialValue: preferredProviderName,
 			confirmHint: "open",
 			cancelHint: "close",
@@ -3904,6 +3982,10 @@ async function handleSubsList(
 		if (!selectedProviderName) return;
 
 		preferredProviderName = selectedProviderName;
+		if (selectedProviderName.startsWith("builtin:")) {
+			await showBuiltinProviderInfo(ctx, selectedProviderName.slice("builtin:".length));
+			continue;
+		}
 		const entry = all.find((candidate) => subProviderName(candidate) === selectedProviderName);
 		if (!entry) continue;
 		await showSubscriptionActions(pi, ctx, config, entry, poolManager);
@@ -5998,6 +6080,7 @@ async function handleSubsMenu(
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
 		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
+		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
 	];
 	let preferredAction = "list";
 
@@ -6037,6 +6120,9 @@ async function handleSubsMenu(
 				break;
 			case "limits":
 				await handleSubsLimits(ctx);
+				break;
+			case "statusbar":
+				await handleSubsStatusbar(ctx);
 				break;
 		}
 	}
@@ -6324,6 +6410,195 @@ async function handlePresetMenu(
 }
 
 // ==========================================================================
+// Status bar (/subs statusbar) -- omarchy-style footer
+// ==========================================================================
+
+const STATUS_BAR_QUOTA_REFRESH_MS = 5 * 60_000;
+const STATUS_BAR_CLOCK_MS = 30_000;
+
+const STATUS_BAR_GLYPHS: Record<string, string> = {
+	anthropic: "\u2733",
+	"openai-codex": "\u2b22",
+	"github-copilot": "\u25c9",
+	"google-gemini-cli": "\u2726",
+	"google-antigravity": "\u25b2",
+	minimax: "\u25c6",
+	"minimax-cn": "\u25c6",
+};
+
+const STATUS_BAR_SHORT_NAMES: Record<string, string> = {
+	anthropic: "claude",
+	"openai-codex": "codex",
+	"github-copilot": "copilot",
+	"google-gemini-cli": "gemini",
+	"google-antigravity": "agrav",
+	minimax: "minimax",
+	"minimax-cn": "minimax-cn",
+};
+
+interface StatusBarAccount {
+	providerName: string;
+	shortName: string;
+	glyph: string;
+}
+
+let statusBarAccounts: StatusBarAccount[] = [];
+const statusBarQuota = new Map<string, QuotaCheckResult>();
+let statusBarQuotaFetchedAt = 0;
+let statusBarRefreshInFlight = false;
+
+function statusBarShortName(providerName: string, subs: SubEntry[]): string {
+	const entry = subs.find((candidate) => subProviderName(candidate) === providerName);
+	if (entry?.label) {
+		return entry.label.length > 12 ? `${entry.label.slice(0, 11)}\u2026` : entry.label;
+	}
+	const base = getBaseProvider(providerName) || providerName;
+	const short = STATUS_BAR_SHORT_NAMES[base] || base;
+	return entry ? `${short}#${entry.index}` : short;
+}
+
+function collectStatusBarAccounts(ctx: ExtensionContext): StatusBarAccount[] {
+	const subs = normalizeEntries(mergeConfigs(loadGlobalConfig(), parseEnvConfig()));
+	return collectQuotaAccounts(ctx).map((account) => ({
+		providerName: account.providerName,
+		shortName: statusBarShortName(account.providerName, subs),
+		glyph: STATUS_BAR_GLYPHS[account.baseProvider] || "\u25cf",
+	}));
+}
+
+function refreshStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void {
+	if (statusBarRefreshInFlight) return;
+	statusBarRefreshInFlight = true;
+	statusBarAccounts = collectStatusBarAccounts(ctx);
+	const accounts = collectQuotaAccounts(ctx);
+	runQuotaChecks(accounts.filter((account) => account.auth))
+		.then((results) => {
+			statusBarQuota.clear();
+			for (const account of accounts) {
+				if (account.auth) continue;
+				statusBarQuota.set(account.providerName, {
+					account,
+					kind: "missing-auth",
+					summary: "not logged in",
+					details: [],
+					score: 0,
+				});
+			}
+			for (const result of results) {
+				statusBarQuota.set(result.account.providerName, result);
+			}
+			statusBarQuotaFetchedAt = Date.now();
+		})
+		.catch(() => {})
+		.finally(() => {
+			statusBarRefreshInFlight = false;
+			onDone();
+		});
+}
+
+function renderStatusBarLine(
+	theme: Theme,
+	footerData: ReadonlyFooterDataProvider,
+	ctx: ExtensionContext,
+	width: number,
+): string {
+	const separator = theme.fg("dim", " \u2502 ");
+	const segments: string[] = [];
+	for (const account of statusBarAccounts) {
+		const quota = statusBarQuota.get(account.providerName);
+		const percent = quota?.worstRemainingPercent;
+		const status = percent !== undefined
+			? `${Math.round(percent)}%`
+			: quota
+				? getQuotaStatusGlyph(quota.kind)
+				: "\u2026";
+		const text = `${account.glyph} ${account.shortName} ${status}`;
+		if (ctx.model?.provider === account.providerName) {
+			segments.push(theme.style(text, { fg: "accent", bold: true }));
+		} else {
+			const color = quota && quota.kind !== "missing-auth" && quota.kind !== "error"
+				? quotaBarColor(percent)
+				: "dim";
+			segments.push(theme.fg(color, text));
+		}
+	}
+	const left = segments.join(separator);
+
+	const now = new Date();
+	const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+	const rightParts: string[] = [];
+	if (ctx.model) rightParts.push(ctx.model.id);
+	const usage = ctx.getContextUsage();
+	if (usage?.percent != null) rightParts.push(`ctx ${Math.round(usage.percent)}%`);
+	const branch = footerData.getGitBranch();
+	if (branch) rightParts.push(`\u2387 ${branch}`);
+	rightParts.push(clock);
+	const right = theme.fg("dim", rightParts.join("  "));
+
+	const gap = width - visibleWidth(left) - visibleWidth(right);
+	if (gap >= 1) {
+		return left + " ".repeat(gap) + right;
+	}
+	return truncateToWidth(`${left} ${right}`, width);
+}
+
+function createStatusBarComponent(
+	tui: TUI,
+	theme: Theme,
+	footerData: ReadonlyFooterDataProvider,
+	ctx: ExtensionContext,
+) {
+	const unsubscribeBranch = footerData.onBranchChange(() => tui.requestRender());
+	const clockTimer = setInterval(() => tui.requestRender(), STATUS_BAR_CLOCK_MS);
+	const refreshTimer = setInterval(
+		() => refreshStatusBarQuota(ctx, () => tui.requestRender()),
+		STATUS_BAR_QUOTA_REFRESH_MS,
+	);
+	if (statusBarAccounts.length === 0) {
+		statusBarAccounts = collectStatusBarAccounts(ctx);
+	}
+	if (Date.now() - statusBarQuotaFetchedAt > STATUS_BAR_QUOTA_REFRESH_MS) {
+		refreshStatusBarQuota(ctx, () => tui.requestRender());
+	}
+
+	return {
+		dispose() {
+			unsubscribeBranch();
+			clearInterval(clockTimer);
+			clearInterval(refreshTimer);
+		},
+		invalidate() {},
+		render(width: number): string[] {
+			return [renderStatusBarLine(theme, footerData, ctx, width)];
+		},
+	};
+}
+
+function applyStatusBar(ctx: ExtensionContext | ExtensionCommandContext, enabled: boolean): void {
+	if (!ctx.hasUI) return;
+	if (!enabled) {
+		ctx.ui.setFooter(undefined);
+		return;
+	}
+	ctx.ui.setFooter((tui, theme, footerData) =>
+		createStatusBarComponent(tui, theme, footerData, ctx),
+	);
+}
+
+async function handleSubsStatusbar(ctx: ExtensionCommandContext): Promise<void> {
+	const config = loadGlobalConfig();
+	config.statusBar = !config.statusBar;
+	saveGlobalConfig(config);
+	applyStatusBar(ctx, config.statusBar);
+	ctx.ui.notify(
+		config.statusBar
+			? "multi-pass status bar enabled (/subs statusbar to disable)"
+			: "multi-pass status bar disabled, default footer restored",
+		"info",
+	);
+}
+
+// ==========================================================================
 // Extension entry point
 // ==========================================================================
 
@@ -6408,6 +6683,10 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 		if (statusParts.length > 0) {
 			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
+		}
+
+		if (loadGlobalConfig().statusBar) {
+			applyStatusBar(ctx, true);
 		}
 
 		await enforceProjectRestriction(ctx, "session");
@@ -6499,7 +6778,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "status", "limits"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "status", "limits", "statusbar"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -6534,6 +6813,9 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "quota":
 				case "usage":
 					return handleSubsLimits(ctx);
+				case "statusbar":
+				case "bar":
+					return handleSubsStatusbar(ctx);
 				default:
 					return handleSubsMenu(pi, ctx, poolManager);
 			}
