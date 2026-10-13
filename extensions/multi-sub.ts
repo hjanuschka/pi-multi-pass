@@ -44,6 +44,9 @@ import {
 	writeFileSync,
 } from "fs";
 import { homedir } from "os";
+import { hostname } from "node:os";
+import lockfile from "proper-lockfile";
+import { createShareOffer, receiveShare, shareAddresses, validateBundle, type ShareBundle, type SharedAccount, type ShareOffer } from "../lib/share.ts";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
 import type {
@@ -79,6 +82,7 @@ import {
 	matchesKey,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 	type SelectItem,
 	type TUI,
 } from "@earendil-works/pi-tui";
@@ -6482,6 +6486,116 @@ async function handlePoolMenu(
 }
 
 // ==========================================================================
+// /subs share and receive
+// ==========================================================================
+
+function portableOAuth(account: string, baseProvider: string, label: string | undefined, auth: AuthStorageEntry | undefined): SharedAccount | undefined {
+	if (auth?.type !== "oauth" || typeof auth.access !== "string" || typeof auth.refresh !== "string"
+		|| !auth.access || !auth.refresh || typeof auth.expires !== "number") return undefined;
+	const credential: SharedAccount["credential"] = { type: "oauth", access: auth.access, refresh: auth.refresh, expires: auth.expires };
+	for (const key of ["accountId", "projectId", "enterpriseUrl"] as const) {
+		if (typeof auth[key] === "string") credential[key] = auth[key];
+	}
+	return { providerName: account, baseProvider, ...(label ? { label } : {}), credential };
+}
+
+const activeShares = new Set<ShareOffer>();
+
+async function handleSubsShare(ctx: ExtensionCommandContext): Promise<void> {
+	if (ctx.mode !== "tui") { ctx.ui.notify("/subs share requires an interactive terminal", "warning"); return; }
+	const config = loadGlobalConfig();
+	const auth = getAuthStorage(ctx);
+	const candidates = [
+		...Object.keys(PROVIDER_TEMPLATES).filter((p) => PROVIDER_TEMPLATES[p].buildOAuth)
+			.map((p) => portableOAuth(p, p, undefined, auth.get(p))),
+		...config.subscriptions.map((s) => portableOAuth(subProviderName(s), s.provider, s.label, auth.get(subProviderName(s)))),
+	].filter((a): a is SharedAccount => Boolean(a));
+	if (!candidates.length) { ctx.ui.notify("No OAuth accounts with refresh credentials to share", "warning"); return; }
+	const chosen = await ctx.ui.select("Share one OAuth account (experimental)", candidates.map((a) => `${a.label || a.providerName} [${a.providerName}]`));
+	const account = candidates.find((a) => `${a.label || a.providerName} [${a.providerName}]` === chosen);
+	if (!account) return;
+	if (!(await ctx.ui.confirm("Copy OAuth credentials?", `The receiver can access ${account.providerName} as you. A copied refresh token may invalidate the original login when refreshed. Continue?`))) return;
+	const addresses = shareAddresses();
+	if (!addresses.length) { ctx.ui.notify("No private LAN/VPN IPv4 address found", "error"); return; }
+	const address = addresses.length === 1 ? addresses[0] : await ctx.ui.select("Use private interface", addresses);
+	if (!address) return;
+	let offer: Awaited<ReturnType<typeof createShareOffer>> | undefined;
+	try {
+		offer = await createShareOffer({ schemaVersion: 1, accounts: [account] }, address);
+		activeShares.add(offer);
+		const current = offer;
+		const pending = await ctx.ui.custom<{ name: string; code: string } | null>((tui, theme, _kb, done) => {
+			void current.pending.then(done);
+			const lines = current.qr.trimEnd().split("\n");
+			let showUri = false;
+			return {
+				render(width: number) {
+				return [theme.fg("accent", "Scan this QR (expires in 2 minutes)"),
+					...(lines.some((line) => visibleWidth(line) > width)
+						? [theme.fg("warning", "Widen terminal to scan the QR, or press u for the URI.")]
+						: lines),
+					...(showUri ? wrapTextWithAnsi(current.uri, width) : []),
+					theme.fg("warning", "QR and URI are sensitive until expiry. Verify the receiver."),
+					"Press u to reveal URI for /subs receive, Esc to cancel."];
+				},
+				invalidate() {},
+				handleInput(data: string) {
+					if (data === "u") { showUri = !showUri; tui.requestRender(); }
+					if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { current.close(); done(null); }
+				},
+			};
+		});
+		if (!pending) { ctx.ui.notify("Share cancelled or expired", "info"); return; }
+		const approved = await ctx.ui.confirm("Approve receiver?", `${pending.name} - verify code ${pending.code} matches the receiver. Copy ${account.providerName}?`);
+		current.approve(approved);
+		const delivered = approved && await current.completed;
+		ctx.ui.notify(delivered ? "Credential sent to receiver (source copy kept)" : "Share denied or expired", delivered ? "info" : "warning");
+	} catch (error) {
+		ctx.ui.notify(`Share failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+	} finally { offer?.close(); if (offer) activeShares.delete(offer); }
+}
+
+async function importShareBundle(bundle: ShareBundle): Promise<string[]> {
+	validateBundle(bundle);
+	const authPath = join(getAgentDir(), "auth.json");
+	mkdirSync(dirname(authPath), { recursive: true, mode: 0o700 });
+	if (!existsSync(authPath)) writeFileSync(authPath, "{}", { mode: 0o600 });
+	const release = await lockfile.lock(authPath, { realpath: false, retries: { retries: 10, minTimeout: 50 } });
+	try {
+		const stored = JSON.parse(readFileSync(authPath, "utf-8"));
+		const config = loadGlobalConfig();
+		const added: string[] = [];
+		for (const item of bundle.accounts) {
+			if (!PROVIDER_TEMPLATES[item.baseProvider]?.buildOAuth || ![item.baseProvider, ...Array.from({ length: 99 }, (_, i) => `${item.baseProvider}-${i + 2}`)].includes(item.providerName)) throw new Error("Unsupported provider in bundle");
+			let index = 2;
+			while (stored[`${item.baseProvider}-${index}`] || config.subscriptions.some((s) => s.provider === item.baseProvider && s.index === index)) index++;
+			const name = `${item.baseProvider}-${index}`;
+			stored[name] = item.credential;
+			config.subscriptions.push({ provider: item.baseProvider, index, ...(item.label ? { label: item.label } : {}) });
+			added.push(name);
+		}
+		// Save config before auth: an auth write failure leaves harmless unauthed entries.
+		saveGlobalConfig(config);
+		writeFileSync(authPath, JSON.stringify(stored, null, 2), { mode: 0o600 });
+		return added;
+	} finally { await release(); }
+}
+
+async function handleSubsReceive(ctx: ExtensionCommandContext): Promise<void> {
+	if (!ctx.hasUI) { ctx.ui.notify("/subs receive requires an interactive prompt", "warning"); return; }
+	const uri = await ctx.ui.input("Paste the share QR URI (keep it private)");
+	if (!uri) return;
+	if (!(await ctx.ui.confirm("Import OAuth credentials?", "This device will receive a copy of provider access and refresh tokens. Only accept from a computer you trust."))) return;
+	try {
+		const bundle = await receiveShare(uri.trim(), hostname(), (code) => ctx.ui.notify(`Verify ${code} on the sender, then approve there`, "info"));
+		const added = await importShareBundle(bundle);
+		ctx.ui.notify(`Imported: ${added.join(", ")}. Restart pi to register the new subscriptions.`, "info");
+	} catch (error) {
+		ctx.ui.notify(`Receive failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+	}
+}
+
+// ==========================================================================
 // /subs main menu
 // ==========================================================================
 
@@ -6500,6 +6614,8 @@ async function handleSubsMenu(
 		{ value: "model", label: "model", description: "Pick a model with pretty subscription labels (replaces /model)" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
 		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
+		{ value: "share", label: "share", description: "Copy an OAuth account using a one-time QR (experimental)" },
+		{ value: "receive", label: "receive", description: "Import an OAuth account from another pi" },
 		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
 		{ value: "intercept-model", label: "intercept-model", description: "Route pi's /model to /subs model (replaces editor)" },
 	];
@@ -6544,6 +6660,12 @@ async function handleSubsMenu(
 				break;
 			case "limits":
 				await handleSubsLimits(ctx);
+				break;
+			case "share":
+				await handleSubsShare(ctx);
+				break;
+			case "receive":
+				await handleSubsReceive(ctx);
 				break;
 			case "statusbar":
 				await handleSubsStatusbar(ctx);
@@ -7141,6 +7263,10 @@ async function handleSubsStatusbar(ctx: ExtensionCommandContext): Promise<void> 
 // ==========================================================================
 
 export default function multiSub(pi: ExtensionAPI) {
+	pi.on("session_shutdown", async () => {
+		for (const offer of activeShares) offer.close();
+		activeShares.clear();
+	});
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));
@@ -7318,7 +7444,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "statusbar", "intercept-model"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "share", "receive", "statusbar", "intercept-model"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -7356,6 +7482,10 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "quota":
 				case "usage":
 					return handleSubsLimits(ctx);
+				case "share":
+					return handleSubsShare(ctx);
+				case "receive":
+					return handleSubsReceive(ctx);
 				case "statusbar":
 				case "bar":
 					return handleSubsStatusbar(ctx);

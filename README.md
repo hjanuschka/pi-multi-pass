@@ -23,6 +23,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Opt-in routing trace**: Record recent selection, skip, and failover decisions only when requested
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits` (Anthropic, Codex, Google)
+- **Experimental OAuth sharing**: Copy one selected account to another pi installation using `/subs share` and `/subs receive` over a private network
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
 - **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
@@ -62,7 +63,9 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs switch       Manually switch to a subscription/provider now
 /subs list         List subscriptions with auth status; select one for quick actions
 /subs status       Detailed status (token expiry, pool membership)
-/subs limits       Check built-in quota/usage support (Codex + Google)
+/subs limits       Check built-in quota/usage support (Anthropic + Codex + Google)
+/subs share        Show a one-time QR to copy one OAuth account (experimental)
+/subs receive      Paste a share URI on another computer to import that account
 ```
 
 ### `/pool` -- Rotation pool and chain management
@@ -397,6 +400,14 @@ When a pool uses the `quota-first` strategy, the same quota checkers are used au
 When a project defines `.pi/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
 
 Future providers can add another checker without changing the `/subs` command surface.
+
+## Experimental: share an OAuth account
+
+`/subs share` picks one authenticated OAuth account and starts a **two-minute**, one-use HTTPS listener on a selected private LAN/VPN interface. Scan its QR in a compatible receiver, or use `/subs receive` on another pi installation and paste the pairing URI. The sender must verify the eight-character code and receiver name before approving. The QR contains a short-lived pairing secret and certificate fingerprint, **not OAuth credentials**. The credential bundle is encrypted to the receiver's ephemeral X25519 key, and the TLS certificate is pinned to the QR. No hosted service or permanent listener is used.
+
+**Security:** A receiver gets the provider's access and refresh tokens, not merely quota data. Share only with devices you trust. A photo of the QR allows someone to request a transfer while it is valid; always compare the receiver name and code on both screens and deny unexpected requests. Transfer works only if both devices can reach each other over a private LAN or VPN (including a tailnet); do not expose the port publicly. The receiver imports under a new extra-subscription name, never overwrites an existing credential, and must restart pi to register the new provider. Omarchy on the *same* machine already reads pi's local auth and does not need this transfer.
+
+**Provider caveat:** OAuth refresh credentials can be rotated or bound to one device/client. Copying a credential can break the source or receiver's next refresh; durability is **not yet validated provider by provider**. This is experimental, not a guarantee of two simultaneously working logins. If either device stops authenticating, log in again on that device. The command does not copy pools, chains, presets or project config. Mobile receivers still need to implement the documented pairing protocol and provider-specific secure credential storage; no mobile receiver ships in this package yet.
 
 ## Environment variable (optional)
 
