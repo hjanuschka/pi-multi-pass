@@ -2543,11 +2543,37 @@ function getBaseProvider(providerName: string): string | undefined {
 // Model cloning
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number) {
+/** Build a model.name that surfaces the subscription label and email in
+ * pi's /model picker. The picker's inline list only shows `id [provider]`,
+ * but model.name is fuzzy-searched and rendered on the "Model Name:" row
+ * when the model is highlighted, so this is how users spot which account
+ * each extra sub represents. */
+function subModelName(entry: SubEntry, originalName: string): string {
+	const parts: string[] = [originalName];
+	if (entry.label) parts.push(entry.label);
+	else parts.push(`#${entry.index}`);
+	try {
+		const credential = readStoredCredential(subProviderName(entry)) as
+			| AuthStorageEntry
+			| undefined;
+		const cached = accountEmailCache.get(subProviderName(entry));
+		const email = cached
+			?? (typeof credential?.email === "string" ? credential.email : undefined)
+			?? extractEmailFromJwt(
+				typeof credential?.access === "string" ? credential.access : undefined,
+			);
+		if (email) parts.push(email);
+	} catch {
+		// best effort; just omit the email
+	}
+	return parts.join(" \u00b7 ");
+}
+
+function cloneModels(originalProvider: string, index: number, entry?: SubEntry) {
 	const models = getModels(originalProvider as any) as Model<Api>[];
 	return models.map((m) => ({
 		id: m.id,
-		name: `${m.name} (#${index})`,
+		name: entry ? subModelName(entry, m.name) : `${m.name} (#${index})`,
 		api: m.api,
 		reasoning: m.reasoning,
 		thinkingLevelMap: m.thinkingLevelMap ? { ...m.thinkingLevelMap } : undefined,
@@ -2606,7 +2632,7 @@ function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
 	return merged.map((m) => ({
 		...m,
 		provider: name,
-		name: `${m.name} (#${entry.index})`,
+		name: subModelName(entry, m.name),
 	}));
 }
 
@@ -2625,7 +2651,7 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const modifyModels = oauth ? template.buildModifyModels?.(name) : undefined;
 	const builtinModels = getModels(entry.provider as any) as Model<Api>[];
 	const baseUrl = builtinModels[0]?.baseUrl || "";
-	const models = cloneModels(entry.provider, entry.index);
+	const models = cloneModels(entry.provider, entry.index, entry);
 
 	// Static `models` is only the startup baseline; refreshModels swaps in the
 	// live merged catalog (builtin + remote overlay) on every refresh cycle.
