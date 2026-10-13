@@ -23,7 +23,7 @@ pi install git:github.com/hjanuschka/pi-multi-pass
 - **Opt-in routing trace**: Record recent selection, skip, and failover decisions only when requested
 - **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
 - **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits` (Anthropic, Codex, Google)
-- **Experimental offline OAuth sharing**: Copy one selected account via QR frames using `/subs share` and `/subs receive` (no network required)
+- **Experimental offline OAuth sharing**: Copy one selected account using QR frames or a single copy/paste export string (no network required)
 - **Smarter retries**: Preserve failover progress across internal replay retries
 - **Project affinity**: Restrict which subs/pools/chains are used per project
 - **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
@@ -64,8 +64,8 @@ When one account hits a rate limit during an assistant turn, multi-pass automati
 /subs list         List subscriptions with auth status; select one for quick actions
 /subs status       Detailed status (token expiry, pool membership)
 /subs limits       Check built-in quota/usage support (Anthropic + Codex + Google)
-/subs share        Show offline QR frames containing one OAuth account (experimental)
-/subs receive      Paste QR frame URIs to import that account on another pi
+/subs share        Show offline QR frames or a full copyable export string (experimental)
+/subs receive      Paste the full string or frame URIs into another pi
 ```
 
 ### `/pool` -- Rotation pool and chain management
@@ -403,9 +403,9 @@ Future providers can add another checker without changing the `/subs` command su
 
 ## Experimental: share an OAuth account
 
-`/subs share` picks one authenticated OAuth account and renders it as one or more numbered QR frames. Scan every frame in any order with a compatible receiver; use `n`/`p` to advance/backtrack, or `u` to reveal each frame's URI for offline `/subs receive` on another pi installation. No network, listener, relay, or source computer uptime is required after capture. The receiver imports under a new extra-subscription name, never overwrites an existing credential, and must restart pi to register the new provider. Omarchy on the *same* machine already reads pi's local auth and does not need this transfer.
+`/subs share` picks one authenticated OAuth account and renders it as one or more numbered QR frames. Scan every frame in any order with a compatible receiver; use `n`/`p` to advance/backtrack, `u` to reveal a frame URI, or `c` to open a **single copyable export string** in pi's editor for pi-to-pi transfer. On the other computer, run `/subs receive` and choose `Paste one full export string` (or paste QR frame URIs individually). Line breaks from terminal wrapping are accepted in the full string. No network, listener, relay, or source computer uptime is required after capture. The receiver imports under a new extra-subscription name, never overwrites an existing credential, and must restart pi to register the new provider. Omarchy on the *same* machine already reads pi's local auth and does not need this transfer.
 
-**Security:** The frames contain the **entire OAuth access and refresh credential**. Base64 and compression are not encryption. Anyone who captures all frames can use the account; the frames do **not expire or self-destruct** when you close the display. Only share in a private setting with a device you trust. To invalidate leaked credentials, revoke them at the provider. Do not screenshot, log, or upload the QR URIs. See [offline QR protocol](docs/share-protocol.md) for the v2 frame format.
+**Security:** The frames contain the **entire OAuth access and refresh credential**. Base64 and compression are not encryption. Anyone who captures all frames can use the account; the frames do **not expire or self-destruct** when you close the display. Only share in a private setting with a device you trust. To invalidate leaked credentials, revoke them at the provider. Do not screenshot, log, or upload the QR URIs or full string. Copying to a system clipboard may sync the credential to other devices or retain it in clipboard history; clear it after import. See [offline QR protocol](docs/share-protocol.md) for the v2 frame and text formats.
 
 **Provider caveat:** OAuth refresh credentials can be rotated or bound to one device/client. Copying a credential can break the source or receiver's next refresh; durability is **not yet validated provider by provider**. This is experimental, not a guarantee of two simultaneously working logins. If either device stops authenticating, log in again on that device. The command does not copy pools, chains, presets or project config. Mobile receivers still need to implement the offline QR decoder and provider-specific secure credential storage; no mobile receiver ships in this package yet.
 

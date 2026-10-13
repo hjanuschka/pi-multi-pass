@@ -12,6 +12,7 @@ export type ShareBundle = { schemaVersion: 2; accounts: SharedAccount[] };
 export type ShareFrame = { uri: string; qr: string; index: number; total: number };
 
 const PREFIX = "mps-share://v2/";
+const TEXT_PREFIX = `${PREFIX}bundle/`;
 const CHUNK_LENGTH = 200;
 const MAX_FRAMES = 256;
 const MAX_DECOMPRESSED_BYTES = 100_000;
@@ -35,10 +36,40 @@ function digest(data: Buffer): string {
 	return createHash("sha256").update(data).digest("hex");
 }
 
-/** Offline, bearer QR export: every part of the OAuth credential is in these frames. */
-export async function encodeShareFrames(bundle: ShareBundle): Promise<ShareFrame[]> {
+function compressBundle(bundle: ShareBundle): Buffer {
 	validateBundle(bundle);
 	const data = deflateRawSync(Buffer.from(JSON.stringify(bundle)));
+	if (data.toString("base64url").length > CHUNK_LENGTH * MAX_FRAMES) throw new Error("Account is too large to export");
+	return data;
+}
+
+function unpackBundle(encoded: string, checksum: string): ShareBundle {
+	const data = Buffer.from(encoded, "base64url");
+	if (digest(data) !== checksum) throw new Error("Share data failed checksum");
+	let bundle: ShareBundle;
+	try { bundle = JSON.parse(inflateRawSync(data, { maxOutputLength: MAX_DECOMPRESSED_BYTES }).toString()) as ShareBundle; }
+	catch { throw new Error("Invalid share payload"); }
+	validateBundle(bundle);
+	return bundle;
+}
+
+/** One copy/paste string for pi-to-pi transfer. This is a bearer credential. */
+export function encodeShareText(bundle: ShareBundle): string {
+	const data = compressBundle(bundle);
+	return `${TEXT_PREFIX}${digest(data)}/${data.toString("base64url")}`;
+}
+
+export function decodeShareText(text: string): ShareBundle {
+	const compact = text.replace(/\s+/g, "");
+	if (compact.length > CHUNK_LENGTH * MAX_FRAMES + TEXT_PREFIX.length + 65 || !compact.startsWith(TEXT_PREFIX)) throw new Error("Invalid share text");
+	const fields = compact.slice(TEXT_PREFIX.length).split("/");
+	if (fields.length !== 2 || !/^[0-9a-f]{64}$/.test(fields[0]) || !/^[A-Za-z0-9_-]+$/.test(fields[1])) throw new Error("Invalid share text");
+	return unpackBundle(fields[1], fields[0]);
+}
+
+/** Offline, bearer QR export: every part of the OAuth credential is in these frames. */
+export async function encodeShareFrames(bundle: ShareBundle): Promise<ShareFrame[]> {
+	const data = compressBundle(bundle);
 	const encoded = data.toString("base64url");
 	const total = Math.ceil(encoded.length / CHUNK_LENGTH);
 	if (total > MAX_FRAMES) throw new Error("Account is too large to export as QR frames");
@@ -74,6 +105,10 @@ export class ShareFrameCollector {
 	private chunks = new Map<number, string>();
 
 	add(uri: string): { received: number; total: number; bundle?: ShareBundle } {
+		if (uri.replace(/\s+/g, "").startsWith(TEXT_PREFIX)) {
+			if (this.chunks.size) throw new Error("Cannot mix a full export with QR frames");
+			return { received: 1, total: 1, bundle: decodeShareText(uri) };
+		}
 		const frame = parseShareFrame(uri.trim());
 		if (this.id && (frame.id !== this.id || frame.total !== this.total || frame.checksum !== this.checksum)) throw new Error("QR belongs to another export");
 		if (this.chunks.has(frame.index) && this.chunks.get(frame.index) !== frame.chunk) throw new Error("Conflicting QR frame");
@@ -83,12 +118,6 @@ export class ShareFrameCollector {
 		this.chunks.set(frame.index, frame.chunk);
 		if (this.chunks.size < frame.total) return { received: this.chunks.size, total: frame.total };
 		const encoded = Array.from({ length: frame.total }, (_, i) => this.chunks.get(i + 1)).join("");
-		const data = Buffer.from(encoded, "base64url");
-		if (digest(data) !== frame.checksum) throw new Error("QR data failed checksum");
-		let bundle: ShareBundle;
-		try { bundle = JSON.parse(inflateRawSync(data, { maxOutputLength: MAX_DECOMPRESSED_BYTES }).toString()) as ShareBundle; }
-		catch { throw new Error("Invalid share payload"); }
-		validateBundle(bundle);
-		return { received: frame.total, total: frame.total, bundle };
+		return { received: frame.total, total: frame.total, bundle: unpackBundle(encoded, frame.checksum) };
 	}
 }

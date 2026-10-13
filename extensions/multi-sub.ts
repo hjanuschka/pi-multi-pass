@@ -45,7 +45,7 @@ import {
 } from "fs";
 import { homedir } from "os";
 import lockfile from "proper-lockfile";
-import { encodeShareFrames, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
+import { decodeShareText, encodeShareFrames, encodeShareText, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
 import type {
@@ -6511,34 +6511,41 @@ async function handleSubsShare(ctx: ExtensionCommandContext): Promise<void> {
 	const chosen = await ctx.ui.select("Share one OAuth account (experimental)", candidates.map((a) => `${a.label || a.providerName} [${a.providerName}]`));
 	const account = candidates.find((a) => `${a.label || a.providerName} [${a.providerName}]` === chosen);
 	if (!account) return;
-	if (!(await ctx.ui.confirm("Export OAuth credentials in QR?", `Anyone who photographs ALL QR frames can access ${account.providerName}. These codes do not expire or self-destruct. Copied refresh tokens may break the original login. Show them?`))) return;
+	if (!(await ctx.ui.confirm("Export OAuth credentials?", `Anyone with ALL QR frames or the full text string can access ${account.providerName}. They do not expire or self-destruct. Copied refresh tokens may break the original login. Show them?`))) return;
 	try {
-		const frames = await encodeShareFrames({ schemaVersion: 2, accounts: [account] });
-		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-			let index = 0;
-			let showUri = false;
-			return {
-				render(width: number) {
-				const frame = frames[index];
-				const lines = frame.qr.trimEnd().split("\n");
-				return [theme.fg("accent", `OAuth export ${account.providerName} - QR ${frame.index}/${frame.total}`),
-					...(lines.some((line) => visibleWidth(line) > width)
-						? [theme.fg("warning", "Widen terminal to scan the QR, or press u for its URI.")]
-						: lines),
-					...(showUri ? wrapTextWithAnsi(frame.uri, width) : []),
-					theme.fg("warning", "Bearer credential: a copy of every frame grants account access."),
-					"n/Right next, p/Left previous, u reveal URI, Esc close."];
-				},
-				invalidate() {},
-				handleInput(data: string) {
-					if (data === "n" || matchesKey(data, Key.right)) index = (index + 1) % frames.length;
-					else if (data === "p" || matchesKey(data, Key.left)) index = (index + frames.length - 1) % frames.length;
-					else if (data === "u") showUri = !showUri;
-					else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { done(); return; }
-					tui.requestRender();
-				},
-			};
-		});
+		const bundle: ShareBundle = { schemaVersion: 2, accounts: [account] };
+		const frames = await encodeShareFrames(bundle);
+		const fullText = encodeShareText(bundle);
+		while (true) {
+			const action = await ctx.ui.custom<"copy" | "close">((tui, theme, _kb, done) => {
+				let index = 0;
+				let showUri = false;
+				return {
+					render(width: number) {
+						const frame = frames[index];
+						const lines = frame.qr.trimEnd().split("\n");
+						return [theme.fg("accent", `OAuth export ${account.providerName} - QR ${frame.index}/${frame.total}`),
+							...(lines.some((line) => visibleWidth(line) > width)
+								? [theme.fg("warning", "Widen terminal to scan the QR, or press u for its URI.")]
+								: lines),
+							...(showUri ? wrapTextWithAnsi(frame.uri, width) : []),
+							theme.fg("warning", "Bearer credential: a copy of every frame grants account access."),
+							"n/p frames, u reveal frame URI, c full copyable export, Esc close."];
+					},
+					invalidate() {},
+					handleInput(data: string) {
+						if (data === "n" || matchesKey(data, Key.right)) index = (index + 1) % frames.length;
+						else if (data === "p" || matchesKey(data, Key.left)) index = (index + frames.length - 1) % frames.length;
+						else if (data === "u") showUri = !showUri;
+						else if (data === "c") { done("copy"); return; }
+						else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { done("close"); return; }
+						tui.requestRender();
+					},
+				};
+			});
+			if (action !== "copy") break;
+			await ctx.ui.editor("Copy full OAuth export string (bearer credential; clipboard may sync)", fullText);
+		}
 	} catch (error) {
 		ctx.ui.notify(`Share failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}
@@ -6572,22 +6579,30 @@ async function importShareBundle(bundle: ShareBundle): Promise<string[]> {
 
 async function handleSubsReceive(ctx: ExtensionCommandContext): Promise<void> {
 	if (!ctx.hasUI) { ctx.ui.notify("/subs receive requires an interactive prompt", "warning"); return; }
-	const collector = new ShareFrameCollector();
+	const mode = await ctx.ui.select("Receive OAuth credentials from pi", ["Paste one full export string", "Paste QR frame URIs"]);
+	if (!mode) return;
 	try {
-		let progress = "Paste a share QR URI (1 of ?), Esc to cancel";
-		while (true) {
-			const uri = await ctx.ui.input(progress);
-			if (!uri) return;
-			const result = collector.add(uri);
-			if (result.bundle) {
-				const account = result.bundle.accounts[0];
-				if (!(await ctx.ui.confirm("Import OAuth credentials?", `Import ${account.providerName} from ${result.total} offline QR frame(s)? The sender keeps its copy; token refresh on either device may invalidate the other.`))) return;
-				const added = await importShareBundle(result.bundle);
-				ctx.ui.notify(`Imported: ${added.join(", ")}. Restart pi to register the new subscription.`, "info");
-				return;
+		let bundle: ShareBundle;
+		let count = 1;
+		if (mode === "Paste one full export string") {
+			const text = await ctx.ui.editor("Paste full OAuth export string (keep it private)");
+			if (!text) return;
+			bundle = decodeShareText(text);
+		} else {
+			const collector = new ShareFrameCollector();
+			let progress = "Paste a share QR URI (1 of ?), Esc to cancel";
+			while (true) {
+				const uri = await ctx.ui.input(progress);
+				if (!uri) return;
+				const result = collector.add(uri);
+				if (result.bundle) { bundle = result.bundle; count = result.total; break; }
+				progress = `Collected ${result.received}/${result.total} frames. Paste another URI, Esc to cancel`;
 			}
-			progress = `Collected ${result.received}/${result.total} frames. Paste another URI, Esc to cancel`;
 		}
+		const account = bundle.accounts[0];
+		if (!(await ctx.ui.confirm("Import OAuth credentials?", `Import ${account.providerName} from ${count === 1 ? "the export string" : `${count} QR frames`}? The sender keeps its copy; token refresh on either device may invalidate the other.`))) return;
+		const added = await importShareBundle(bundle);
+		ctx.ui.notify(`Imported: ${added.join(", ")}. Restart pi to register the new subscription.`, "info");
 	} catch (error) {
 		ctx.ui.notify(`Receive failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}
