@@ -69,10 +69,12 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-a
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	Container,
+	Input,
 	Key,
 	SelectList,
 	Spacer,
 	Text,
+	fuzzyFilter,
 	matchesKey,
 	truncateToWidth,
 	visibleWidth,
@@ -3694,6 +3696,223 @@ function resolveSwitchTargetModel(
 	return undefined;
 }
 
+interface ModelPickerItem {
+	model: Model<Api>;
+	searchText: string;
+	providerLabel: string;
+	email?: string;
+	isCurrent: boolean;
+	source: "built-in" | "multi-pass";
+}
+
+/** Replacement for pi's /model with per-subscription labels and email.
+ * pi's built-in /model hardcodes `[providerId]` in the inline list and
+ * cannot be overridden (it short-circuits before the extension event
+ * system runs), so we provide /subs model as a labelled drop-in. */
+async function handleSubsModel(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	initialQuery?: string,
+): Promise<void> {
+	const authStorage = getAuthStorage(ctx);
+	const globalConfig = loadGlobalConfig();
+	const subs = normalizeEntries(mergeConfigs(globalConfig, parseEnvConfig()));
+	const providerNamesForEmails = Array.from(new Set([
+		...SUPPORTED_PROVIDERS.filter((provider) => authStorage.hasAuth(provider)),
+		...subs.map((entry) => subProviderName(entry)),
+	]));
+	await resolveAccountEmails(providerNamesForEmails, authStorage);
+
+	const available = ctx.modelRegistry.getAvailable();
+	const items: ModelPickerItem[] = available.map((model) => {
+		const subEntry = subs.find((entry) => subProviderName(entry) === model.provider);
+		const email = getStoredAccountEmail(model.provider, authStorage);
+		const providerLabel = subEntry
+			? subDisplayName(subEntry)
+			: `${PROVIDER_TEMPLATES[model.provider]?.displayName || model.provider} (built-in)`;
+		return {
+			model: model as Model<Api>,
+			providerLabel,
+			email,
+			isCurrent:
+				ctx.model?.provider === model.provider && ctx.model?.id === model.id,
+			source: subEntry ? "multi-pass" : "built-in",
+			searchText: [
+				model.provider,
+				`${model.provider}/${model.id}`,
+				model.id,
+				model.name || "",
+				providerLabel,
+				email || "",
+			].join(" ").toLowerCase(),
+		};
+	});
+	items.sort((a, b) => {
+		if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
+		if (a.source !== b.source) return a.source === "built-in" ? -1 : 1;
+		const providerCmp = a.model.provider.localeCompare(b.model.provider);
+		return providerCmp !== 0 ? providerCmp : a.model.id.localeCompare(b.model.id);
+	});
+
+	if (items.length === 0) {
+		ctx.ui.notify("No authenticated models found. Use /subs login first.", "info");
+		return;
+	}
+
+	if (!ctx.hasUI) {
+		const rendered = items.map(
+			(item) => `${item.model.id} -- ${item.providerLabel}${item.email ? ` [${item.email}]` : ""}`,
+		);
+		const selectedLine = await ctx.ui.select("Switch Model", rendered);
+		if (!selectedLine) return;
+		const index = rendered.indexOf(selectedLine);
+		const selected = index >= 0 ? items[index]?.model : undefined;
+		if (selected) await pi.setModel(selected);
+		return;
+	}
+
+	const selectedModel = await ctx.ui.custom<Model<Api> | null>((tui, theme, _kb, done) => {
+		const searchInput = new Input({ prompt: theme.fg("accent", "\u276f ") });
+		if (initialQuery) searchInput.setValue(initialQuery);
+		searchInput.focused = true;
+
+		let filtered: ModelPickerItem[] = initialQuery
+			? fuzzyFilter(items, initialQuery.toLowerCase(), (item) => item.searchText)
+			: items.slice();
+		let selectedIndex = Math.max(
+			0,
+			filtered.findIndex((item) => item.isCurrent),
+		);
+		let viewStart = 0;
+		const maxVisible = 15;
+
+		const applyQuery = () => {
+			const query = searchInput.getValue().trim().toLowerCase();
+			filtered = query
+				? fuzzyFilter(items, query, (item) => item.searchText)
+				: items.slice();
+			selectedIndex = Math.min(Math.max(0, selectedIndex), Math.max(0, filtered.length - 1));
+			viewStart = 0;
+			tui.requestRender();
+		};
+
+		const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+		const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+		const footerHint = [
+			keyHint("tui.select.confirm", "switch"),
+			keyHint("tui.select.cancel", "close"),
+		].join(" \u2022 ");
+
+		return {
+			render(width: number): string[] {
+				if (selectedIndex < viewStart) viewStart = selectedIndex;
+				if (selectedIndex >= viewStart + maxVisible) {
+					viewStart = selectedIndex - maxVisible + 1;
+				}
+
+				const nameWidth = Math.min(
+					32,
+					Math.max(14, ...filtered.map((item) => visibleWidth(item.model.id))),
+				);
+				const padName = (text: string): string => {
+					const truncated = truncateToWidth(text, nameWidth);
+					return truncated + " ".repeat(Math.max(0, nameWidth - visibleWidth(truncated)));
+				};
+
+				const lines: string[] = [];
+				const push = (line: string) => lines.push(truncateToWidth(line, width));
+				lines.push(...topBorder.render(width));
+				push(theme.fg("accent", theme.bold(" \u2726 multi-pass \u00b7 switch model")));
+				push("");
+				for (const inputLine of searchInput.render(Math.max(1, width - 2))) {
+					push(` ${inputLine}`);
+				}
+				push("");
+
+				if (filtered.length === 0) {
+					push(theme.fg("muted", "   No matching models"));
+				} else {
+					const end = Math.min(filtered.length, viewStart + maxVisible);
+					for (let i = viewStart; i < end; i++) {
+						const item = filtered[i];
+						const isSelected = i === selectedIndex;
+						const cursor = isSelected ? theme.fg("accent", " \u2192 ") : "   ";
+						const currentMarker = item.isCurrent
+							? theme.fg("accent", "\u2713 ")
+							: "  ";
+						const name = isSelected
+							? theme.fg("accent", theme.bold(padName(item.model.id)))
+							: padName(item.model.id);
+						const sourceTag = theme.fg(
+							item.source === "built-in" ? "muted" : "dim",
+							item.source === "built-in" ? "[built-in]" : "[multi-pass]",
+						);
+						const label = theme.fg("muted", item.providerLabel);
+						const email = item.email ? theme.fg("dim", ` \u00b7 ${item.email}`) : "";
+						push(`${cursor}${currentMarker}${name}  ${sourceTag} ${label}${email}`);
+					}
+					if (filtered.length > maxVisible) {
+						push(theme.fg("dim", `   (${selectedIndex + 1}/${filtered.length})`));
+					}
+				}
+
+				push("");
+				push(theme.fg("dim", ` ${footerHint}`));
+				lines.push(...bottomBorder.render(width));
+				return lines;
+			},
+			invalidate() {
+				topBorder.invalidate?.();
+				bottomBorder.invalidate?.();
+				searchInput.invalidate();
+			},
+			handleInput(data: string) {
+				if (matchesKey(data, Key.up)) {
+					if (selectedIndex > 0) {
+						selectedIndex--;
+						tui.requestRender();
+					}
+					return;
+				}
+				if (matchesKey(data, Key.down)) {
+					if (selectedIndex < filtered.length - 1) {
+						selectedIndex++;
+						tui.requestRender();
+					}
+					return;
+				}
+				if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+					done(filtered[selectedIndex]?.model ?? null);
+					return;
+				}
+				if (matchesKey(data, Key.escape)) {
+					done(null);
+					return;
+				}
+				const before = searchInput.getValue();
+				searchInput.handleInput(data);
+				if (searchInput.getValue() !== before) applyQuery();
+			},
+		};
+	});
+
+	if (!selectedModel) return;
+	if (ctx.model?.provider === selectedModel.provider && ctx.model?.id === selectedModel.id) {
+		ctx.ui.notify(`Already using ${selectedModel.id} on ${selectedModel.provider}.`, "info");
+		return;
+	}
+	const success = await pi.setModel(selectedModel);
+	if (!success) {
+		ctx.ui.notify(`Failed to switch to ${selectedModel.id}.`, "warning");
+		return;
+	}
+	const subEntry = subs.find((entry) => subProviderName(entry) === selectedModel.provider);
+	const providerLabel = subEntry
+		? subDisplayName(subEntry)
+		: PROVIDER_TEMPLATES[selectedModel.provider]?.displayName || selectedModel.provider;
+	ctx.ui.notify(`Switched to ${selectedModel.id} (${providerLabel}).`, "info");
+}
+
 async function handleSubsSwitch(
 	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
@@ -6273,6 +6492,7 @@ async function handleSubsMenu(
 		{ value: "login", label: "login", description: "Login to a subscription" },
 		{ value: "logout", label: "logout", description: "Logout from a subscription" },
 		{ value: "switch", label: "switch", description: "Switch to a different subscription/provider now" },
+		{ value: "model", label: "model", description: "Pick a model with pretty subscription labels (replaces /model)" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
 		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
 		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
@@ -6309,6 +6529,9 @@ async function handleSubsMenu(
 				break;
 			case "switch":
 				await handleSubsSwitch(pi, ctx);
+				break;
+			case "model":
+				await handleSubsModel(pi, ctx);
 				break;
 			case "status":
 				await handleSubsStatus(ctx);
@@ -6992,7 +7215,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "status", "limits", "statusbar"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "statusbar"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -7020,6 +7243,9 @@ export default function multiSub(pi: ExtensionAPI) {
 					return handleSubsLogout(ctx);
 				case "switch":
 					return handleSubsSwitch(pi, ctx, rest || undefined);
+				case "model":
+				case "m":
+					return handleSubsModel(pi, ctx, rest || undefined);
 				case "status":
 				case "info":
 					return handleSubsStatus(ctx);
