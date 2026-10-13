@@ -3891,10 +3891,14 @@ function extractEmailFromJwt(token: string | undefined): string | undefined {
 	return undefined;
 }
 
+const accountEmailCache = new Map<string, string>();
+
 function getStoredAccountEmail(
 	providerName: string,
 	authStorage: AuthStorageCompat,
 ): string | undefined {
+	const cached = accountEmailCache.get(providerName);
+	if (cached) return cached;
 	const auth = authStorage.get(providerName);
 	if (!auth) return undefined;
 	if (typeof auth.email === "string" && auth.email) return auth.email;
@@ -3908,6 +3912,32 @@ function getStoredAccountEmail(
 		extractEmailFromJwt(idToken) ??
 		statusBarQuota.get(providerName)?.email
 	);
+}
+
+/** Fill accountEmailCache for providers whose stored credential does not
+ * carry an email (currently Anthropic, whose OAuth token is opaque). One
+ * profile request per provider, cached for the process lifetime. */
+async function resolveAccountEmails(
+	providerNames: string[],
+	authStorage: AuthStorageCompat,
+): Promise<void> {
+	await Promise.all(providerNames.map(async (providerName) => {
+		if (getStoredAccountEmail(providerName, authStorage)) return;
+		const base = getBaseProvider(providerName) || providerName;
+		if (base !== "anthropic") return;
+		const auth = authStorage.get(providerName);
+		if (typeof auth?.access !== "string" || !auth.access) return;
+		try {
+			const profile = await fetchAnthropicProfile(new Headers({
+				Authorization: `Bearer ${auth.access}`,
+				"anthropic-beta": ANTHROPIC_OAUTH_BETA,
+				Accept: "application/json",
+			}));
+			if (profile.email) accountEmailCache.set(providerName, profile.email);
+		} catch {
+			// best effort; the list simply shows no email
+		}
+	}));
 }
 
 async function showBuiltinProviderInfo(
@@ -3943,14 +3973,21 @@ async function handleSubsList(
 		const all = normalizeEntries(mergeConfigs(config, envEntries));
 		const authStorage = getAuthStorage(ctx);
 
+		const builtinProviderNames = SUPPORTED_PROVIDERS.filter((provider) =>
+			authStorage.hasAuth(provider),
+		);
+		await resolveAccountEmails(
+			[...builtinProviderNames, ...all.map((entry) => subProviderName(entry))],
+			authStorage,
+		);
+
 		const builtinItems: SelectItem[] = [];
-		for (const provider of SUPPORTED_PROVIDERS) {
-			if (!authStorage.hasAuth(provider)) continue;
+		for (const provider of builtinProviderNames) {
 			const email = getStoredAccountEmail(provider, authStorage);
 			builtinItems.push({
 				value: `builtin:${provider}`,
-				label: `${PROVIDER_TEMPLATES[provider]?.displayName || provider} (built-in)`,
-				description: email ? `[logged in] ${email}` : "[logged in]",
+				label: PROVIDER_TEMPLATES[provider]?.displayName || provider,
+				description: ["[built-in]", "[logged in]", email].filter(Boolean).join(" "),
 			});
 		}
 
