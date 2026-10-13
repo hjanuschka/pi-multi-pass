@@ -2656,6 +2656,9 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	// Static `models` is only the startup baseline; refreshModels swaps in the
 	// live merged catalog (builtin + remote overlay) on every refresh cycle.
 	pi.registerProvider(name, {
+		// Display name pi exposes on the composed provider; used by /login and
+		// available for future UI (e.g. an upstream /model badge fix).
+		name: subDisplayName(entry),
 		baseUrl,
 		api: builtinModels[0]?.api,
 		apiKey: template.apiKey,
