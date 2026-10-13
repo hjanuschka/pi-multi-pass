@@ -55,6 +55,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
+	CustomEditor,
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
@@ -2185,6 +2186,9 @@ interface MultiPassConfig {
 	presets: PresetConfig[];
 	/** Omarchy-style footer status bar. Off by default; toggled with /subs statusbar. */
 	statusBar?: boolean;
+	/** Re-route pi's hardcoded /model to our labelled picker. Off by default;
+	 * replaces the TUI editor so other extensions can't own it concurrently. */
+	interceptModel?: boolean;
 }
 
 /** Project-level config (.pi/multi-pass.json) */
@@ -2231,6 +2235,7 @@ function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
 		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
 		statusBar: parsed.statusBar === true,
+		interceptModel: parsed.interceptModel === true,
 	};
 }
 
@@ -3711,7 +3716,7 @@ interface ModelPickerItem {
  * system runs), so we provide /subs model as a labelled drop-in. */
 async function handleSubsModel(
 	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
+	ctx: ExtensionContext | ExtensionCommandContext,
 	initialQuery?: string,
 ): Promise<void> {
 	const authStorage = getAuthStorage(ctx);
@@ -6496,6 +6501,7 @@ async function handleSubsMenu(
 		{ value: "status", label: "status", description: "Show auth status and token info" },
 		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
 		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
+		{ value: "intercept-model", label: "intercept-model", description: "Route pi's /model to /subs model (replaces editor)" },
 	];
 	let preferredAction = "list";
 
@@ -6541,6 +6547,9 @@ async function handleSubsMenu(
 				break;
 			case "statusbar":
 				await handleSubsStatusbar(ctx);
+				break;
+			case "intercept-model":
+				await handleSubsInterceptModel(ctx, pi);
 				break;
 		}
 	}
@@ -7022,6 +7031,98 @@ function applyStatusBar(ctx: ExtensionContext | ExtensionCommandContext, enabled
 	);
 }
 
+// ==========================================================================
+// /model interception
+//
+// pi hardcodes /model in setupEditorSubmitHandler before the extension event
+// system fires, so registerCommand("model", ...) and on("input", ...) are
+// both too late. The only remaining hook is setEditorComponent: pi copies
+// defaultEditor.onSubmit onto the custom editor via plain property
+// assignment, so we install a property setter that wraps that handler,
+// intercepts /model text, and forwards everything else unchanged.
+// ==========================================================================
+
+let modelInterceptContext: ExtensionContext | ExtensionCommandContext | undefined;
+let modelInterceptPi: ExtensionAPI | undefined;
+let modelInterceptActive = false;
+
+function createModelInterceptEditor(
+	tui: any,
+	theme: any,
+	keybindings: any,
+): CustomEditor {
+	const editor = new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+	let wrapped: ((text: string) => void) | undefined;
+	Object.defineProperty(editor, "onSubmit", {
+		configurable: true,
+		get() {
+			return wrapped;
+		},
+		set(handler: ((text: string) => void) | undefined) {
+			wrapped = handler
+				? async (text: string) => {
+					const trimmed = text.trim();
+					if (trimmed === "/model" || trimmed.startsWith("/model ")) {
+						const query = trimmed.startsWith("/model ")
+							? trimmed.slice(7).trim() || undefined
+							: undefined;
+						editor.setText("");
+						if (modelInterceptContext && modelInterceptPi) {
+							try {
+								await handleSubsModel(
+									modelInterceptPi,
+									modelInterceptContext as ExtensionCommandContext,
+									query,
+								);
+							} catch (error) {
+								console.error("multi-pass /model intercept failed", error);
+							}
+						}
+						return;
+					}
+					handler(text);
+				}
+				: undefined;
+		},
+	});
+	return editor;
+}
+
+function applyModelIntercept(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	pi: ExtensionAPI,
+	enabled: boolean,
+): void {
+	modelInterceptContext = ctx;
+	modelInterceptPi = pi;
+	if (!ctx.hasUI) return;
+	if (enabled && !modelInterceptActive) {
+		ctx.ui.setEditorComponent((tui, theme, keybindings) =>
+			createModelInterceptEditor(tui, theme, keybindings),
+		);
+		modelInterceptActive = true;
+	} else if (!enabled && modelInterceptActive) {
+		ctx.ui.setEditorComponent(undefined);
+		modelInterceptActive = false;
+	}
+}
+
+async function handleSubsInterceptModel(
+	ctx: ExtensionCommandContext,
+	pi: ExtensionAPI,
+): Promise<void> {
+	const config = loadGlobalConfig();
+	config.interceptModel = !config.interceptModel;
+	saveGlobalConfig(config);
+	applyModelIntercept(ctx, pi, config.interceptModel);
+	ctx.ui.notify(
+		config.interceptModel
+			? "multi-pass /model intercept enabled (/subs intercept-model to disable)"
+			: "multi-pass /model intercept disabled, pi's /model restored",
+		"info",
+	);
+}
+
 async function handleSubsStatusbar(ctx: ExtensionCommandContext): Promise<void> {
 	const config = loadGlobalConfig();
 	config.statusBar = !config.statusBar;
@@ -7122,9 +7223,11 @@ export default function multiSub(pi: ExtensionAPI) {
 			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
 		}
 
-		if (loadGlobalConfig().statusBar) {
+		const persisted = loadGlobalConfig();
+		if (persisted.statusBar) {
 			applyStatusBar(ctx, true);
 		}
+		applyModelIntercept(ctx, pi, persisted.interceptModel === true);
 
 		await enforceProjectRestriction(ctx, "session");
 	});
@@ -7215,7 +7318,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage extra OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "statusbar"];
+			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "model", "status", "limits", "statusbar", "intercept-model"];
 			const filtered = subcommands.filter((s) => s.startsWith(prefix));
 			return filtered.length > 0
 				? filtered.map((s) => ({ value: s, label: s }))
@@ -7256,6 +7359,9 @@ export default function multiSub(pi: ExtensionAPI) {
 				case "statusbar":
 				case "bar":
 					return handleSubsStatusbar(ctx);
+				case "intercept-model":
+				case "intercept":
+					return handleSubsInterceptModel(ctx, pi);
 				default:
 					return handleSubsMenu(pi, ctx, poolManager);
 			}
