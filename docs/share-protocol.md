@@ -1,29 +1,38 @@
-# Experimental `/subs share` protocol v1
+# Experimental offline `/subs share` QR format (v2)
 
-This protocol copies OAuth credentials. A compatible receiver must be trusted with the provider account; this is not a quota-only pairing mechanism. No server persists after the one-shot transfer. Provider-specific support for simultaneous refresh on two devices is **not yet validated**.
+`/subs share` copies a selected OAuth credential **entirely inside the QR frames**, with no network connection, server, pairing handshake or cloud service. The receiver can scan frames in any order; `/subs receive` accepts their URIs one at a time. A native iOS or Android app can decode the same frames and store the credential in its secure local storage.
 
-## Discovery and handoff
+## Security boundary
 
-The sender listens on a selected private IPv4 interface (LAN or tailnet) for at most 120 seconds. Its QR is a URI of the form `mps-share://v1/<base64url(JSON)>`, where JSON contains:
+**Each complete set of frames is a bearer credential.** Anyone who photographs, records, copies, or receives *all* the frames can reconstruct both the access token and refresh token. The data is compressed and base64url-encoded, **not encrypted**. There is no expiry or revocation for a captured QR; closing the screen only hides the local display. Revoking a leaked credential must happen at the provider. Never log QR URIs, send them to analytics or cloud services, include them in screenshots/backups, or render them in session transcripts. Display the QR only after the user explicitly confirms the account and risk. Transfer only in a private setting to a device you trust. There is no way to make an all-in-one, no-passphrase QR confidential from someone who scans it.
 
-```json
-{ "a": "192.168.1.2", "p": 12345, "f": "SHA256_CERT_FINGERPRINT_HEX", "s": "32_RANDOM_BYTES_BASE64URL" }
+Copied provider refresh tokens may rotate or be tied to one device/client. Sharing is experimental; no provider is guaranteed to keep both copies authenticated after refresh. Do not claim persistent multi-device copy until tested for that provider.
+
+## Frame format
+
+Each URI has the form:
+
+```text
+mps-share://v2/<exportId>/<index>/<total>/<sha256>/<chunk>
 ```
 
-The URI is a secret until the session expires. It contains no OAuth tokens. The receiver validates the IP is private, pins the TLS peer's DER certificate SHA-256 fingerprint to `f` **before sending any request bytes**, and posts to `https://<a>:<p>/v1/share`:
+- `exportId`: 8 random bytes as 16 lowercase hexadecimal digits, different for every invocation.
+- `index`: 1-based frame number; `total`: number of frames, at most 256.
+- `sha256`: lowercase hex SHA-256 of the **compressed** bytes, used to detect damaged/mixed frames, not to authenticate the sender.
+- `chunk`: up to 200 characters of the base64url-encoded compressed bundle. The full base64url string is split into consecutive chunks; concatenate them in index order, decode, verify SHA-256, then raw-DEFLATE inflate with a 100,000-byte output limit. Validate JSON and the credential allowlist before import.
+
+Bundle plaintext before compression:
 
 ```json
-{ "secret": "s", "name": "Receiver device name", "publicKey": "X25519_SPKI_DER_BASE64URL" }
+{
+  "schemaVersion": 2,
+  "accounts": [{
+    "providerName": "openai-codex-2",
+    "baseProvider": "openai-codex",
+    "label": "Work",
+    "credential": { "type": "oauth", "access": "<secret>", "refresh": "<secret>", "expires": 1791892800000, "accountId": "<provider-id>" }
+  }]
+}
 ```
 
-The receiver shows the first eight uppercase hexadecimal digits of `SHA256(UTF8("pi-multi-pass-share-v1:" + s + ":" + publicKey))`. The sender shows the receiver name and the same code and must approve explicitly. Only the first valid request can be approved; denial, expiry, cancel or delivery closes the listener. TLS is self-signed and ephemeral. Do not use a general-purpose `insecure` HTTPS mode without the pin comparison.
-
-## Encrypted response
-
-After approval the response is JSON `{ "key", "salt", "nonce", "data", "tag" }`, where `key` is a fresh sender X25519 public key in SPKI DER base64url, `salt` is 32 random bytes, and `nonce` is 12 random bytes. Derive `shared = X25519(senderPrivate, receiverPublic)` and `aesKey = HKDF-SHA256(shared, salt, UTF8("pi-multi-pass-share-v1"), 32)`. `data` is AES-256-GCM encryption of UTF-8 JSON; `tag` is its authentication tag. Fields other than `key` are base64url-encoded. Never log, cache, upload or expose the plaintext bundle to unrelated processes. Sender limits request size; receivers must also limit response size. A non-200 response means denied, expired, or already consumed.
-
-The plaintext is `{ "schemaVersion": 1, "accounts": [...] }`. Each account has `providerName`, `baseProvider`, optional `label`, and `credential` with `type: "oauth"`, `access`, `refresh`, `expires` (Unix **milliseconds**), and optional `accountId`, `projectId`, `enterpriseUrl` (provider-specific). Other credentials and config are not included. A receiver must validate the bundle and explicitly choose secure local storage. Native mobile receivers should use Keychain or Keystore-backed storage, not pi's `auth.json` format. Do not assume a token copied from desktop can be refreshed on mobile until verified with that provider.
-
-## Constraints
-
-V1 only supports private IPv4 addresses and one account per invocation. It has no cloud relay, internet endpoint, automatic sync, remote revocation or guarantee that two clients can refresh the same provider credential independently. A compromised receiver can use the imported account until its credential is revoked at the provider. For a desktop pi receiver, `/subs receive` imports under a fresh indexed provider name and requires a pi restart to register it.
+`expires` is Unix **milliseconds**. Optional provider-specific credential fields are `accountId`, `projectId` and `enterpriseUrl`. V2 exports exactly one account per invocation; it does not include other `auth.json` keys, pools, chains, presets or project config. A desktop receiver imports as a fresh indexed subscription and never overwrites an existing login. Mobile receivers must validate the schema and use Keychain or Keystore-backed storage, never a plaintext settings file. Frames can be re-scanned; this is not a one-time transfer. Receiver UIs should display collected count and reject conflicting or mixed exports. Delete partial frame data on cancel.

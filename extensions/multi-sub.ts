@@ -44,9 +44,8 @@ import {
 	writeFileSync,
 } from "fs";
 import { homedir } from "os";
-import { hostname } from "node:os";
 import lockfile from "proper-lockfile";
-import { createShareOffer, receiveShare, shareAddresses, validateBundle, type ShareBundle, type SharedAccount, type ShareOffer } from "../lib/share.ts";
+import { encodeShareFrames, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
 import type {
@@ -6499,8 +6498,6 @@ function portableOAuth(account: string, baseProvider: string, label: string | un
 	return { providerName: account, baseProvider, ...(label ? { label } : {}), credential };
 }
 
-const activeShares = new Set<ShareOffer>();
-
 async function handleSubsShare(ctx: ExtensionCommandContext): Promise<void> {
 	if (ctx.mode !== "tui") { ctx.ui.notify("/subs share requires an interactive terminal", "warning"); return; }
 	const config = loadGlobalConfig();
@@ -6514,45 +6511,37 @@ async function handleSubsShare(ctx: ExtensionCommandContext): Promise<void> {
 	const chosen = await ctx.ui.select("Share one OAuth account (experimental)", candidates.map((a) => `${a.label || a.providerName} [${a.providerName}]`));
 	const account = candidates.find((a) => `${a.label || a.providerName} [${a.providerName}]` === chosen);
 	if (!account) return;
-	if (!(await ctx.ui.confirm("Copy OAuth credentials?", `The receiver can access ${account.providerName} as you. A copied refresh token may invalidate the original login when refreshed. Continue?`))) return;
-	const addresses = shareAddresses();
-	if (!addresses.length) { ctx.ui.notify("No private LAN/VPN IPv4 address found", "error"); return; }
-	const address = addresses.length === 1 ? addresses[0] : await ctx.ui.select("Use private interface", addresses);
-	if (!address) return;
-	let offer: Awaited<ReturnType<typeof createShareOffer>> | undefined;
+	if (!(await ctx.ui.confirm("Export OAuth credentials in QR?", `Anyone who photographs ALL QR frames can access ${account.providerName}. These codes do not expire or self-destruct. Copied refresh tokens may break the original login. Show them?`))) return;
 	try {
-		offer = await createShareOffer({ schemaVersion: 1, accounts: [account] }, address);
-		activeShares.add(offer);
-		const current = offer;
-		const pending = await ctx.ui.custom<{ name: string; code: string } | null>((tui, theme, _kb, done) => {
-			void current.pending.then(done);
-			const lines = current.qr.trimEnd().split("\n");
+		const frames = await encodeShareFrames({ schemaVersion: 2, accounts: [account] });
+		await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+			let index = 0;
 			let showUri = false;
 			return {
 				render(width: number) {
-				return [theme.fg("accent", "Scan this QR (expires in 2 minutes)"),
+				const frame = frames[index];
+				const lines = frame.qr.trimEnd().split("\n");
+				return [theme.fg("accent", `OAuth export ${account.providerName} - QR ${frame.index}/${frame.total}`),
 					...(lines.some((line) => visibleWidth(line) > width)
-						? [theme.fg("warning", "Widen terminal to scan the QR, or press u for the URI.")]
+						? [theme.fg("warning", "Widen terminal to scan the QR, or press u for its URI.")]
 						: lines),
-					...(showUri ? wrapTextWithAnsi(current.uri, width) : []),
-					theme.fg("warning", "QR and URI are sensitive until expiry. Verify the receiver."),
-					"Press u to reveal URI for /subs receive, Esc to cancel."];
+					...(showUri ? wrapTextWithAnsi(frame.uri, width) : []),
+					theme.fg("warning", "Bearer credential: a copy of every frame grants account access."),
+					"n/Right next, p/Left previous, u reveal URI, Esc close."];
 				},
 				invalidate() {},
 				handleInput(data: string) {
-					if (data === "u") { showUri = !showUri; tui.requestRender(); }
-					if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { current.close(); done(null); }
+					if (data === "n" || matchesKey(data, Key.right)) index = (index + 1) % frames.length;
+					else if (data === "p" || matchesKey(data, Key.left)) index = (index + frames.length - 1) % frames.length;
+					else if (data === "u") showUri = !showUri;
+					else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { done(); return; }
+					tui.requestRender();
 				},
 			};
 		});
-		if (!pending) { ctx.ui.notify("Share cancelled or expired", "info"); return; }
-		const approved = await ctx.ui.confirm("Approve receiver?", `${pending.name} - verify code ${pending.code} matches the receiver. Copy ${account.providerName}?`);
-		current.approve(approved);
-		const delivered = approved && await current.completed;
-		ctx.ui.notify(delivered ? "Credential sent to receiver (source copy kept)" : "Share denied or expired", delivered ? "info" : "warning");
 	} catch (error) {
 		ctx.ui.notify(`Share failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-	} finally { offer?.close(); if (offer) activeShares.delete(offer); }
+	}
 }
 
 async function importShareBundle(bundle: ShareBundle): Promise<string[]> {
@@ -6583,13 +6572,22 @@ async function importShareBundle(bundle: ShareBundle): Promise<string[]> {
 
 async function handleSubsReceive(ctx: ExtensionCommandContext): Promise<void> {
 	if (!ctx.hasUI) { ctx.ui.notify("/subs receive requires an interactive prompt", "warning"); return; }
-	const uri = await ctx.ui.input("Paste the share QR URI (keep it private)");
-	if (!uri) return;
-	if (!(await ctx.ui.confirm("Import OAuth credentials?", "This device will receive a copy of provider access and refresh tokens. Only accept from a computer you trust."))) return;
+	const collector = new ShareFrameCollector();
 	try {
-		const bundle = await receiveShare(uri.trim(), hostname(), (code) => ctx.ui.notify(`Verify ${code} on the sender, then approve there`, "info"));
-		const added = await importShareBundle(bundle);
-		ctx.ui.notify(`Imported: ${added.join(", ")}. Restart pi to register the new subscriptions.`, "info");
+		let progress = "Paste a share QR URI (1 of ?), Esc to cancel";
+		while (true) {
+			const uri = await ctx.ui.input(progress);
+			if (!uri) return;
+			const result = collector.add(uri);
+			if (result.bundle) {
+				const account = result.bundle.accounts[0];
+				if (!(await ctx.ui.confirm("Import OAuth credentials?", `Import ${account.providerName} from ${result.total} offline QR frame(s)? The sender keeps its copy; token refresh on either device may invalidate the other.`))) return;
+				const added = await importShareBundle(result.bundle);
+				ctx.ui.notify(`Imported: ${added.join(", ")}. Restart pi to register the new subscription.`, "info");
+				return;
+			}
+			progress = `Collected ${result.received}/${result.total} frames. Paste another URI, Esc to cancel`;
+		}
 	} catch (error) {
 		ctx.ui.notify(`Receive failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}
@@ -6614,8 +6612,8 @@ async function handleSubsMenu(
 		{ value: "model", label: "model", description: "Pick a model with pretty subscription labels (replaces /model)" },
 		{ value: "status", label: "status", description: "Show auth status and token info" },
 		{ value: "limits", label: "limits", description: "Check built-in quota support (Anthropic + Codex + Google)" },
-		{ value: "share", label: "share", description: "Copy an OAuth account using a one-time QR (experimental)" },
-		{ value: "receive", label: "receive", description: "Import an OAuth account from another pi" },
+		{ value: "share", label: "share", description: "Export one OAuth account as offline QR frames (experimental)" },
+		{ value: "receive", label: "receive", description: "Import offline QR frames from another pi" },
 		{ value: "statusbar", label: "statusbar", description: "Toggle omarchy-style footer status bar" },
 		{ value: "intercept-model", label: "intercept-model", description: "Route pi's /model to /subs model (replaces editor)" },
 	];
@@ -7263,10 +7261,6 @@ async function handleSubsStatusbar(ctx: ExtensionCommandContext): Promise<void> 
 // ==========================================================================
 
 export default function multiSub(pi: ExtensionAPI) {
-	pi.on("session_shutdown", async () => {
-		for (const offer of activeShares) offer.close();
-		activeShares.clear();
-	});
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const all = normalizeEntries(mergeConfigs(config, envEntries));

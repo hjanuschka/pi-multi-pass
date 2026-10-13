@@ -1,46 +1,48 @@
 import assert from 'node:assert/strict';
-import { createShareOffer, decodeShareUri, receiveShare, validateBundle } from '../lib/share.ts';
+import { randomBytes } from 'node:crypto';
+import { encodeShareFrames, parseShareFrame, ShareFrameCollector, validateBundle } from '../lib/share.ts';
 
 const bundle = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   accounts: [{ providerName: 'openai-codex-2', baseProvider: 'openai-codex', label: 'Work',
-    credential: { type: 'oauth', access: 'fake-access', refresh: 'fake-refresh', expires: Date.now() + 3600000 } }],
+    credential: { type: 'oauth', access: 'fake-access', refresh: 'fake-refresh', expires: Date.now() + 3600000, accountId: 'account-1' } }],
 };
 validateBundle(bundle);
-assert.throws(() => validateBundle({ schemaVersion: 1, accounts: [{ ...bundle.accounts[0], credential: { type: 'api_key' } }] }));
-assert.throws(() => decodeShareUri('mps-share://v1/' + Buffer.from(JSON.stringify({ a: '8.8.8.8', p: 443, f: 'A'.repeat(64), s: 'a'.repeat(43) })).toString('base64url')));
+assert.throws(() => validateBundle({ schemaVersion: 2, accounts: [{ ...bundle.accounts[0], credential: { type: 'api_key' } }] }));
+assert.throws(() => validateBundle({ schemaVersion: 2, accounts: [{ ...bundle.accounts[0], credential: { ...bundle.accounts[0].credential, surprise: 'secret' } }] }));
+assert.throws(() => parseShareFrame('mps-share://v1/old'));
 
-const offer = await createShareOffer(bundle, '127.0.0.1');
-try {
-  const parsed = decodeShareUri(offer.uri);
-  assert.equal(parsed.address, '127.0.0.1');
-  assert.ok(!offer.uri.includes('fake-refresh'));
-  const seen = [];
-  const receiving = receiveShare(offer.uri, 'test device', code => seen.push(code));
-  const pending = await offer.pending;
-  assert.equal(pending.name, 'test device');
-  assert.equal(pending.code, seen[0]);
-  offer.approve(true);
-  assert.deepEqual(await receiving, bundle);
-  assert.equal(await offer.completed, true);
-  await assert.rejects(receiveShare(offer.uri, 'replay', () => {}));
-} finally { offer.close(); }
+const tiny = { schemaVersion: 2, accounts: [{ providerName: 'anthropic', baseProvider: 'anthropic',
+  credential: { type: 'oauth', access: 'a', refresh: 'b', expires: 3 } }] };
+const small = await encodeShareFrames(tiny);
+assert.equal(small.length, 1);
+assert.ok(small[0].qr.length > 0);
+const one = new ShareFrameCollector();
+assert.deepEqual(one.add(small[0].uri).bundle, tiny);
+assert.deepEqual(one.add(small[0].uri).bundle, tiny);
 
-const wrongCert = await createShareOffer(bundle, '127.0.0.1');
-try {
-  const payload = JSON.parse(Buffer.from(wrongCert.uri.split('/').pop(), 'base64url'));
-  payload.f = 'A'.repeat(64);
-  await assert.rejects(receiveShare('mps-share://v1/' + Buffer.from(JSON.stringify(payload)).toString('base64url'), 'other', () => {}), /fingerprint mismatch/);
-  wrongCert.close();
-  assert.equal(await wrongCert.pending, null);
-} finally { wrongCert.close(); }
+const large = structuredClone(bundle);
+large.accounts[0].credential.access = randomBytes(1800).toString('base64url');
+large.accounts[0].credential.refresh = randomBytes(1800).toString('base64url');
+const frames = await encodeShareFrames(large);
+assert.ok(frames.length > 1);
+assert.ok(frames.every(f => f.uri.length < 600));
+const collector = new ShareFrameCollector();
+for (const frame of frames.slice().reverse().slice(0, -1)) {
+  assert.equal(collector.add(frame.uri).bundle, undefined);
+}
+assert.deepEqual(collector.add(frames[0].uri).bundle, large);
 
-const denied = await createShareOffer(bundle, '127.0.0.1');
-try {
-  const receiving = receiveShare(denied.uri, 'bad device', () => {});
-  await denied.pending;
-  denied.approve(false);
-  await assert.rejects(receiving);
-} finally { denied.close(); }
+const mixed = new ShareFrameCollector();
+mixed.add(frames[0].uri);
+assert.throws(() => mixed.add(small[0].uri), /another export/);
+const changed = frames[0].uri.slice(0, -1) + (frames[0].uri.endsWith('A') ? 'B' : 'A');
+assert.throws(() => mixed.add(changed), /Conflicting QR frame/);
+const corrupt = new ShareFrameCollector();
+for (const frame of frames.slice(0, -1)) corrupt.add(frame.uri);
+const last = frames.at(-1).uri;
+const pos = last.length - 10;
+const tampered = last.slice(0, pos) + (last[pos] === 'A' ? 'B' : 'A') + last.slice(pos + 1);
+assert.throws(() => corrupt.add(tampered), /QR data failed checksum/);
 
-console.log('share protocol OK');
+console.log('offline QR share protocol OK');
