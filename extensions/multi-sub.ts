@@ -46,6 +46,7 @@ import {
 import { homedir } from "os";
 import lockfile from "proper-lockfile";
 import { decodeShareText, encodeShareFrames, encodeShareText, ShareFrameCollector, validateBundle, type ShareBundle, type SharedAccount } from "../lib/share.ts";
+import { configuredModelOverride, matchesCatalogModel, mergeCatalog, minimaxBase, minimaxChoiceRank, ordinaryModelChoices, type CatalogEntry } from "../lib/model-choices.ts";
 import { dirname, isAbsolute, join } from "path";
 import { pathToFileURL } from "url";
 import type {
@@ -2589,7 +2590,9 @@ function findSelectableModelForProvider(
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of minimaxBase(providerName)
+		? providerModelChoices(ctx, providerName)
+		: getModels(baseProvider as any) as Model<Api>[]) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -2778,19 +2781,64 @@ function storedOverlayModels(baseProvider: string): Model<Api>[] {
  * pi-multi-pass release.
  */
 function liveSubscriptionModels(entry: SubEntry, name: string): Model<Api>[] {
-	const builtin = getModels(entry.provider as any) as Model<Api>[];
-	const overlay = storedOverlayModels(entry.provider);
-	const merged = [...builtin];
-	for (const model of overlay) {
-		const existing = merged.findIndex((m) => m.id === model.id);
-		if (existing >= 0) merged[existing] = model;
-		else merged.push(model);
-	}
-	return merged.map((m) => ({
-		...m,
+	const catalog = subscriptionCatalog(entry.provider);
+	const models = catalog.map(({ model }) => ({
+		...model,
 		provider: name,
-		name: subModelName(entry, m.name),
+		name: subModelName(entry, model.name),
 	}));
+	mirroredCatalogs.set(name, catalog.map((item, index) => ({ ...item, model: models[index] })));
+	return models;
+}
+
+// Ordinary choices are a projection; registration and saved-ID lookup keep the full catalog.
+const mirroredCatalogs = new Map<string, CatalogEntry[]>();
+const subscriptionRegistrations = new Map<string, unknown>();
+
+function subscriptionCatalog(provider: string): CatalogEntry[] {
+	return mergeCatalog(getModels(provider as any) as Model<Api>[], storedOverlayModels(provider));
+}
+
+function ordinaryChoices(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	models: Model<Api>[],
+	current?: Model<Api>,
+): Model<Api>[] {
+	let config: unknown;
+	try {
+		const path = join(getAgentDir(), "models.json");
+		config = existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : {};
+	} catch {
+		// An unreadable override file must not hide a potentially custom model.
+		return models;
+	}
+	const catalogs = new Map<string, CatalogEntry[]>();
+	return ordinaryModelChoices(models, (model) => {
+		const base = minimaxBase(model.provider);
+		if (!base || configuredModelOverride(config, model.provider, model.id)) return false;
+		const registry = ctx.modelRegistry;
+		if (typeof registry.getRegisteredProviderConfig !== "function"
+			|| typeof registry.getRegisteredNativeProvider !== "function") return false;
+		const registered = registry.getRegisteredProviderConfig(model.provider);
+		const native = registry.getRegisteredNativeProvider?.(model.provider);
+		const own = subscriptionRegistrations.get(model.provider) as Record<string, unknown> | undefined;
+		// Pi shallow-copies registrations. Compare the actual layer (including model
+		// array and refresh callback identity), not a tag on flattened models.
+		if (native || (registered && (!own || Object.entries(registered).some(([key, value]) => own[key] !== value)))) return false;
+		let catalog = mirroredCatalogs.get(model.provider);
+		if (!catalog) {
+			if (model.provider !== base) return false;
+			catalog = catalogs.get(base) ?? subscriptionCatalog(base);
+			catalogs.set(base, catalog);
+		}
+		const expected = catalog.find((item) => item.model.id === model.id);
+		return !!expected && matchesCatalogModel(model, model.provider === base
+			? expected.model : { ...expected.model, headers: undefined });
+	}, current);
+}
+
+function providerModelChoices(ctx: ExtensionContext | ExtensionCommandContext, provider: string): Model<Api>[] {
+	return ordinaryChoices(ctx, ctx.modelRegistry.getAll().filter((model) => model.provider === provider));
 }
 
 // ==========================================================================
@@ -2817,9 +2865,13 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 	const baseUrl = builtinModels[0]?.baseUrl || "";
 	const models = cloneModels(entry.provider, entry.index, entry);
 
+	mirroredCatalogs.set(name, builtinModels.map((model, index) => ({
+		origin: "builtin",
+		model: { ...model, ...models[index], provider: name },
+	})));
 	// Static `models` is only the startup baseline; refreshModels swaps in the
 	// live merged catalog (builtin + remote overlay) on every refresh cycle.
-	pi.registerProvider(name, {
+	const registration = {
 		// Display name pi exposes on the composed provider; used by /login and
 		// available for future UI (e.g. an upstream /model badge fix).
 		name: subDisplayName(entry),
@@ -2829,7 +2881,9 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 		oauth: oauth && modifyModels ? { ...oauth, modifyModels } : oauth,
 		models,
 		refreshModels: async () => liveSubscriptionModels(entry, name),
-	});
+	};
+	subscriptionRegistrations.set(name, registration);
+	pi.registerProvider(name, registration);
 }
 
 // ==========================================================================
@@ -3849,7 +3903,9 @@ function resolveSwitchTargetModel(
 	if (!baseProvider) {
 		return undefined;
 	}
-	for (const baseModel of getModels(baseProvider as any) as Model<Api>[]) {
+	for (const baseModel of minimaxBase(providerName)
+		? providerModelChoices(ctx, providerName)
+		: getModels(baseProvider as any) as Model<Api>[]) {
 		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
 		if (candidate) {
 			return candidate as Model<Api>;
@@ -3885,7 +3941,7 @@ async function handleSubsModel(
 	]));
 	await resolveAccountEmails(providerNamesForEmails, authStorage);
 
-	const available = ctx.modelRegistry.getAvailable();
+	const available = ordinaryChoices(ctx, ctx.modelRegistry.getAvailable(), ctx.model);
 	const items: ModelPickerItem[] = available.map((model) => {
 		const subEntry = subs.find((entry) => subProviderName(entry) === model.provider);
 		const email = getStoredAccountEmail(model.provider, authStorage);
@@ -3913,7 +3969,8 @@ async function handleSubsModel(
 		if (a.isCurrent !== b.isCurrent) return a.isCurrent ? -1 : 1;
 		if (a.source !== b.source) return a.source === "built-in" ? -1 : 1;
 		const providerCmp = a.model.provider.localeCompare(b.model.provider);
-		return providerCmp !== 0 ? providerCmp : a.model.id.localeCompare(b.model.id);
+		return providerCmp !== 0 ? providerCmp
+			: minimaxChoiceRank(a.model) - minimaxChoiceRank(b.model) || a.model.id.localeCompare(b.model.id);
 	});
 
 	if (items.length === 0) {
@@ -5319,13 +5376,32 @@ async function createAndPersistPool(
 	return pool;
 }
 
-function getSelectableModelsForPool(pool: PoolConfig): string[] {
-	return (getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id);
+function getModelsForPool(pool: PoolConfig, ctx?: ExtensionContext | ExtensionCommandContext): string[] {
+	if (!minimaxBase(pool.baseProvider)) {
+		return (getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id);
+	}
+	const models = subscriptionCatalog(pool.baseProvider).map(({ model }) => model.id);
+	if (ctx) {
+		models.push(...ctx.modelRegistry.getAll()
+			.filter((model) => model.provider === pool.baseProvider || pool.members.includes(model.provider))
+			.map((model) => model.id));
+	}
+	return [...new Set(models)];
+}
+
+function getSelectableModelsForPool(pool: PoolConfig, ctx: ExtensionCommandContext): string[] {
+	if (!minimaxBase(pool.baseProvider)) return getModelsForPool(pool);
+	const models = ctx.modelRegistry.getAll()
+		.filter((model) => model.provider === pool.baseProvider || pool.members.includes(model.provider));
+	return [...new Set(ordinaryChoices(ctx, models).map((model) => model.id))]
+		.sort((a, b) => minimaxChoiceRank({ provider: pool.baseProvider, id: a })
+			- minimaxChoiceRank({ provider: pool.baseProvider, id: b }));
 }
 
 function createChainValidationError(
 	config: MultiPassConfig,
 	chain: ChainConfig,
+	ctx?: ExtensionCommandContext,
 ): string | null {
 	if (!chain.name.trim()) {
 		return "Chain name is required.";
@@ -5342,7 +5418,7 @@ function createChainValidationError(
 		if (!pool) {
 			return `Chain entry pool "${entry.pool}" does not exist.`;
 		}
-		const selectableModels = getSelectableModelsForPool(pool);
+		const selectableModels = getModelsForPool(pool, ctx);
 		if (selectableModels.length === 0) {
 			return `Pool "${pool.name}" has no selectable models for ${pool.baseProvider}.`;
 		}
@@ -5357,13 +5433,14 @@ function createChainValidationError(
 function buildChainConfig(
 	config: MultiPassConfig,
 	input: { name: string; entries: ChainEntryConfig[]; enabled?: boolean },
+	ctx?: ExtensionCommandContext,
 ): { ok: true; chain: ChainConfig } | { ok: false; error: string } {
 	const chain: ChainConfig = {
 		name: input.name.trim(),
 		entries: input.entries.map((entry) => ({ ...entry })),
 		enabled: input.enabled ?? true,
 	};
-	const validationError = createChainValidationError(config, chain);
+	const validationError = createChainValidationError(config, chain, ctx);
 	if (validationError) {
 		return { ok: false, error: validationError };
 	}
@@ -5827,7 +5904,7 @@ function getChainEntryIssue(entry: ChainEntryConfig, config: MultiPassConfig): s
 	if (!pool.enabled) {
 		return `invalid pool: ${pool.name} disabled`;
 	}
-	const selectableModels = getSelectableModelsForPool(pool);
+	const selectableModels = getModelsForPool(pool);
 	if (selectableModels.length === 0) {
 		return `invalid model: no selectable models for ${pool.baseProvider}`;
 	}
@@ -6147,7 +6224,7 @@ async function handlePoolChainCreate(
 			continue;
 		}
 
-		const selectableModels = getSelectableModelsForPool(pool);
+		const selectableModels = getSelectableModelsForPool(pool, ctx);
 		if (selectableModels.length === 0) {
 			ctx.ui.notify(
 				`Pool "${pool.name}" has no selectable models for ${pool.baseProvider}.`,
@@ -6174,7 +6251,7 @@ async function handlePoolChainCreate(
 		name: chainName.trim(),
 		entries,
 		enabled: true,
-	});
+	}, ctx);
 	if (!built.ok) {
 		ctx.ui.notify(built.error, "warning");
 		return;
@@ -6914,7 +6991,9 @@ async function handlePresetCreate(
 		const base = getBaseProvider(provider);
 		if (!base) continue;
 
-		const models = (getModels(base as any) as Model<Api>[]).map((m) => m.id);
+		const models = (minimaxBase(provider)
+			? providerModelChoices(ctx, provider)
+			: getModels(base as any) as Model<Api>[]).map((m) => m.id);
 		if (models.length === 0) {
 			ctx.ui.notify(`No models available for ${provider}.`, "warning");
 			continue;

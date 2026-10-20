@@ -46,6 +46,15 @@ pi install git:github.com/hjanuschka/pi-multi-pass
   (e.g. `gpt-6-astra` for Codex) reach extra accounts without a
   pi-multi-pass release
 
+For MiniMax, `/subs model`, new pool-chain entries, and new preset entries prefer
+`MiniMax-M3.1-Flash`, then `MiniMax-M3`, when supplied by the host catalog. Older
+catalog text models stay registered for saved chains, presets, explicit switches,
+and the current selection. Explicit `models.json` model/provider overrides and
+other extensions' model registrations remain available. If the host cannot expose
+registration provenance, choices are kept rather than hiding potentially custom
+models. This does not change pi's native `/model` picker or add model metadata to
+an older host catalog; a host with only M3 offers M3.
+
 ## Quick start
 
 ```
