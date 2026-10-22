@@ -2097,15 +2097,15 @@ async function selectQuotaResultCards(
 		const container = new Container();
 		let selectedIndex = initialIndex >= 0 ? initialIndex : 0;
 
-		const header = new Text(theme.fg("accent", theme.bold("Subscription Limits")));
-		const overview = new Text(theme.fg("dim", formatQuotaOverview(results)));
+		const header = new Text(theme.fg("accent", theme.bold("Subscription Limits")), 1, 0);
+		const overview = new Text(theme.fg("dim", formatQuotaOverview(results)), 1, 0);
 		const cardsContainer = new Container();
 		const footer = new Text(theme.fg("dim", [
 			keyHint("tui.select.up", "up"),
 			keyHint("tui.select.down", "down"),
 			keyHint("tui.select.confirm", "details"),
 			keyHint("tui.select.cancel", "close"),
-		].join(" \u2022 ")));
+		].join(" \u2022 ")), 1, 0);
 
 		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 		container.addChild(header);
@@ -2123,7 +2123,7 @@ async function selectQuotaResultCards(
 					isCurrent: result.account.providerName === currentProviderName,
 					isBest: result.account.providerName === bestProviderName,
 				});
-				for (const line of lines) cardsContainer.addChild(new Text(line));
+				for (const line of lines) cardsContainer.addChild(new Text(line, 1, 0));
 				if (index < results.length - 1) cardsContainer.addChild(new Spacer(1));
 			});
 		};
