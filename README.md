@@ -110,7 +110,7 @@ Enabled with `/subs keeper` (or `"tokenKeeper": true` in
   network when another process already stored a usable token
 - writes the rotated credential in that same locked transaction, so a slow
   provider or a cancelled request cannot drop it
-- covers built-in logins (`anthropic`, `openai-codex`, ...) as well as extra
+- covers built-in logins (`anthropic`, `openai`, `openai-codex`, ...) as well as extra
   subscriptions
 
 Off by default: it changes who refreshes your credentials, so enable it only
@@ -423,7 +423,8 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 | Provider key | Service |
 |---|---|
 | `anthropic` | Claude Pro/Max |
-| `openai-codex` | ChatGPT Plus/Pro (Codex) |
+| `openai` | ChatGPT subscription (new OpenAI OAuth) |
+| `openai-codex` | ChatGPT Plus/Pro (Codex, legacy) |
 | `github-copilot` | GitHub Copilot |
 | `google-gemini-cli` | Google Cloud Code Assist |
 | `google-antigravity` | Antigravity |
@@ -436,6 +437,7 @@ Currently implemented:
 
 - `anthropic`: fetches Claude subscription usage from `https://api.anthropic.com/api/oauth/usage`, then summarizes the 5-hour and 7-day windows plus any model-scoped weekly limits (for example Opus) for the base account and extra Anthropic subscriptions. Plan and email come from the OAuth profile endpoint.
 - `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
+- `openai`: same ChatGPT subscription backend as `openai-codex`; the new OpenAI OAuth returns a chatgpt.com bearer so the usage endpoint and parser are shared.
 - `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
 - `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
 

@@ -26,7 +26,8 @@
  *
  * Supported providers:
  *   - anthropic          (Claude Pro/Max)
- *   - openai-codex       (ChatGPT Plus/Pro Codex)
+ *   - openai              (ChatGPT subscription, new OAuth)
+ *   - openai-codex       (ChatGPT Plus/Pro Codex, legacy)
  *   - github-copilot     (GitHub Copilot)
  *   - google-gemini-cli  (Google Cloud Code Assist)
  *   - google-antigravity (Antigravity)
@@ -280,8 +281,18 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		},
 	},
 
+	"openai": {
+		displayName: "ChatGPT subscription (OpenAI)",
+		usesCallbackServer: true,
+		buildOAuth(index: number) {
+			return flowBackedOAuth("openai", `ChatGPT #${index}`, {
+				usesCallbackServer: true,
+			});
+		},
+	},
+
 	"openai-codex": {
-		displayName: "ChatGPT Plus/Pro (Codex)",
+		displayName: "ChatGPT Plus/Pro (Codex, legacy)",
 		usesCallbackServer: true,
 		buildOAuth(index: number) {
 			return flowBackedOAuth("openai-codex", `ChatGPT Codex #${index}`, {
@@ -1929,9 +1940,18 @@ const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
 	},
 };
 
+// The new `openai` ChatGPT-subscription OAuth yields the same chatgpt.com
+// bearer as the legacy `openai-codex` flow, so the usage endpoint and parser
+// are shared via the codex checker's `check` function.
+const openaiQuotaChecker: ProviderQuotaChecker = {
+	baseProvider: "openai",
+	check: codexQuotaChecker.check,
+};
+
 const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
 	anthropicQuotaChecker,
 	codexQuotaChecker,
+	openaiQuotaChecker,
 	googleGeminiCliQuotaChecker,
 	googleAntigravityQuotaChecker,
 ];
@@ -7211,6 +7231,7 @@ const STATUS_BAR_CLOCK_MS = 30_000;
 
 const STATUS_BAR_GLYPHS: Record<string, string> = {
 	anthropic: "\u2733",
+	openai: "\u2b22",
 	"openai-codex": "\u2b22",
 	"github-copilot": "\u25c9",
 	"google-gemini-cli": "\u2726",
@@ -7221,6 +7242,7 @@ const STATUS_BAR_GLYPHS: Record<string, string> = {
 
 const STATUS_BAR_SHORT_NAMES: Record<string, string> = {
 	anthropic: "claude",
+	openai: "chatgpt",
 	"openai-codex": "codex",
 	"github-copilot": "copilot",
 	"google-gemini-cli": "gemini",
