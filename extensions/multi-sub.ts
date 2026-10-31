@@ -3353,6 +3353,7 @@ class PoolManager {
 		config: MultiPassConfig,
 		authStorage: { hasAuth(provider: string): boolean },
 		options?: FailoverPlanOptions,
+		ctx?: ExtensionContext | ExtensionCommandContext,
 	): FailoverPlan {
 		const attemptedProviders = options?.attemptedProviders ?? new Set<string>();
 		const visitedChainIndexes = options?.visitedChainIndexes ?? new Set<number>();
@@ -3417,7 +3418,7 @@ class PoolManager {
 				});
 				continue;
 			}
-			const entrySkip = classifyChainEntrySkip(applicable.chain, chainIndex, entry, config);
+			const entrySkip = classifyChainEntrySkip(applicable.chain, chainIndex, entry, config, ctx);
 			if (entrySkip) {
 				skips.push(entrySkip);
 				continue;
@@ -3773,6 +3774,7 @@ class PoolManager {
 				attemptedProviders: cascade.attemptedProviders,
 				visitedChainIndexes: cascade.visitedChainIndexes,
 			},
+			ctx,
 		);
 
 		// Strategy-aware reordering of pool candidates before failover.
@@ -5429,20 +5431,29 @@ async function createAndPersistPool(
 }
 
 function getModelsForPool(pool: PoolConfig, ctx?: ExtensionContext | ExtensionCommandContext): string[] {
-	if (!minimaxBase(pool.baseProvider)) {
-		return (getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id);
-	}
-	const models = subscriptionCatalog(pool.baseProvider).map(({ model }) => model.id);
+	// Prefer Pi's live model registry when a context is available so pools pick up
+	// providers/models that Pi knows about but the static pi-ai catalog does not
+	// (e.g. kimi-coding/k3.1-pro). The static catalog is kept as a fallback for
+	// code paths that run before the registry is populated.
+	const models: string[] = [];
 	if (ctx) {
+		const providers = minimaxBase(pool.baseProvider)
+			? new Set<string>([pool.baseProvider, ...pool.members])
+			: new Set<string>([pool.baseProvider]);
 		models.push(...ctx.modelRegistry.getAll()
-			.filter((model) => model.provider === pool.baseProvider || pool.members.includes(model.provider))
+			.filter((model) => providers.has(model.provider))
 			.map((model) => model.id));
+	}
+	if (minimaxBase(pool.baseProvider)) {
+		models.push(...subscriptionCatalog(pool.baseProvider).map(({ model }) => model.id));
+	} else {
+		models.push(...(getModels(pool.baseProvider as any) as Model<Api>[]).map((model) => model.id));
 	}
 	return [...new Set(models)];
 }
 
 function getSelectableModelsForPool(pool: PoolConfig, ctx: ExtensionCommandContext): string[] {
-	if (!minimaxBase(pool.baseProvider)) return getModelsForPool(pool);
+	if (!minimaxBase(pool.baseProvider)) return getModelsForPool(pool, ctx);
 	const models = ctx.modelRegistry.getAll()
 		.filter((model) => model.provider === pool.baseProvider || pool.members.includes(model.provider));
 	return [...new Set(ordinaryChoices(ctx, models).map((model) => model.id))]
@@ -5948,7 +5959,11 @@ function findChainByName(chains: ChainConfig[], name: string): ChainConfig | und
 	return chains.find((chain) => chain.name === name);
 }
 
-function getChainEntryIssue(entry: ChainEntryConfig, config: MultiPassConfig): string | null {
+function getChainEntryIssue(
+	entry: ChainEntryConfig,
+	config: MultiPassConfig,
+	ctx?: ExtensionContext | ExtensionCommandContext,
+): string | null {
 	const pool = config.pools.find((candidate) => candidate.name === entry.pool);
 	if (!pool) {
 		return `invalid pool: ${entry.pool} missing`;
@@ -5956,7 +5971,7 @@ function getChainEntryIssue(entry: ChainEntryConfig, config: MultiPassConfig): s
 	if (!pool.enabled) {
 		return `invalid pool: ${pool.name} disabled`;
 	}
-	const selectableModels = getModelsForPool(pool);
+	const selectableModels = getModelsForPool(pool, ctx);
 	if (selectableModels.length === 0) {
 		return `invalid model: no selectable models for ${pool.baseProvider}`;
 	}
@@ -6090,6 +6105,7 @@ function classifyChainEntrySkip(
 	chainIndex: number,
 	entry: ChainEntryConfig,
 	config: MultiPassConfig,
+	ctx?: ExtensionContext | ExtensionCommandContext,
 ): FailoverSkip | null {
 	if (!entry.enabled) {
 		return {
@@ -6101,7 +6117,7 @@ function classifyChainEntrySkip(
 			chainIndex,
 		};
 	}
-	const issue = getChainEntryIssue(entry, config);
+	const issue = getChainEntryIssue(entry, config, ctx);
 	if (!issue) return null;
 	const reason = issue.includes("missing")
 		? "missing-pool"
@@ -6123,9 +6139,10 @@ function formatChainEntryStatus(
 	config?: MultiPassConfig,
 	authStorage?: { hasAuth(provider: string): boolean },
 	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+	ctx?: ExtensionContext | ExtensionCommandContext,
 ): string {
 	const entryState = entry.enabled ? "enabled" : "disabled";
-	const issue = config ? getChainEntryIssue(entry, config) : null;
+	const issue = config ? getChainEntryIssue(entry, config, ctx) : null;
 	let healthSuffix = "";
 	if (config && authStorage && poolManager) {
 		const pool = config.pools.find((candidate) => candidate.name === entry.pool);
@@ -6143,16 +6160,17 @@ function formatChainListLine(
 	config?: MultiPassConfig,
 	authStorage?: { hasAuth(provider: string): boolean },
 	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+	ctx?: ExtensionContext | ExtensionCommandContext,
 ): string {
 	const entryLabel = chain.entries.length === 1 ? "entry" : "entries";
 	const invalidEntries = config
-		? chain.entries.filter((entry) => getChainEntryIssue(entry, config)).length
+		? chain.entries.filter((entry) => getChainEntryIssue(entry, config, ctx)).length
 		: 0;
 	let usableEntries = 0;
 	if (config && authStorage && poolManager) {
 		usableEntries = chain.entries.filter((entry) => {
 			if (!entry.enabled) return false;
-			if (getChainEntryIssue(entry, config)) return false;
+			if (getChainEntryIssue(entry, config, ctx)) return false;
 			const pool = config.pools.find((candidate) => candidate.name === entry.pool);
 			if (!pool || !pool.enabled) return false;
 			return summarizePoolHealth(pool, authStorage, poolManager).availableCount > 0;
@@ -6179,14 +6197,15 @@ function formatChainStatusLines(
 	config?: MultiPassConfig,
 	authStorage?: { hasAuth(provider: string): boolean },
 	poolManager?: Pick<PoolManager, "getAvailableMembers" | "isMemberExhausted">,
+	ctx?: ExtensionContext | ExtensionCommandContext,
 ): string[] {
 	const invalidEntries = config
-		? chain.entries.filter((entry) => getChainEntryIssue(entry, config)).length
+		? chain.entries.filter((entry) => getChainEntryIssue(entry, config, ctx)).length
 		: 0;
 	const usableEntries = config && authStorage && poolManager
 		? chain.entries.filter((entry) => {
 			if (!entry.enabled) return false;
-			if (getChainEntryIssue(entry, config)) return false;
+			if (getChainEntryIssue(entry, config, ctx)) return false;
 			const pool = config.pools.find((candidate) => candidate.name === entry.pool);
 			if (!pool || !pool.enabled) return false;
 			return summarizePoolHealth(pool, authStorage, poolManager).availableCount > 0;
@@ -6213,7 +6232,7 @@ function formatChainStatusLines(
 
 	for (let i = 0; i < chain.entries.length; i++) {
 		const entry = chain.entries[i];
-		lines.push(`  ${i + 1}. ${formatChainEntryStatus(entry, config, authStorage, poolManager)}`);
+		lines.push(`  ${i + 1}. ${formatChainEntryStatus(entry, config, authStorage, poolManager, ctx)}`);
 	}
 
 	return lines;
@@ -6237,7 +6256,7 @@ async function handlePoolChainCreate(
 		const latestConfig = loadGlobalConfig();
 		const availablePools = latestConfig.pools;
 		const options = [
-			`--- Selected (${entries.length}): ${entries.map((entry) => formatChainEntryStatus(entry, latestConfig)).join(", ") || "none"} ---`,
+			`--- Selected (${entries.length}): ${entries.map((entry) => formatChainEntryStatus(entry, latestConfig, undefined, undefined, ctx)).join(", ") || "none"} ---`,
 			...availablePools.map((pool) => `${pool.name} -- ${pool.baseProvider} (${pool.enabled ? "enabled" : "disabled"})`),
 			"[Create pool inline]",
 			"[Done - save chain]",
@@ -6330,7 +6349,7 @@ async function handlePoolChainList(
 	await ctx.ui.select(
 		"Chains",
 		config.chains.map((chain) =>
-			formatChainListLine(chain, config, getAuthStorage(ctx), poolManager),
+			formatChainListLine(chain, config, getAuthStorage(ctx), poolManager, ctx),
 		),
 	);
 }
@@ -6410,7 +6429,7 @@ async function handlePoolChainStatus(
 
 	await ctx.ui.select(
 		`Chain Status: ${chain.name}`,
-		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager),
+		formatChainStatusLines(chain, config, getAuthStorage(ctx), poolManager, ctx),
 	);
 }
 
