@@ -64,6 +64,7 @@ import {
 	getAgentDir,
 	keyHint,
 	readStoredCredential,
+	SettingsManager,
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -116,11 +117,14 @@ interface OAuthProviderInterface {
 interface BuiltinOAuthFlow {
 	name: string;
 	isSubscription?: boolean;
-	login(interaction: {
-		signal: AbortSignal;
-		notify(event: AuthEventLike): void;
-		prompt(prompt: AuthPromptLike): Promise<string>;
-	}): Promise<OAuthCredentials>;
+	login(
+		interaction: {
+			signal: AbortSignal;
+			notify(event: AuthEventLike): void;
+			prompt(prompt: AuthPromptLike): Promise<string>;
+		},
+		options?: { getDeviceId?: () => string | undefined },
+	): Promise<OAuthCredentials>;
 	refresh(credential: OAuthCredentials & { type: "oauth" }, signal: AbortSignal): Promise<OAuthCredentials>;
 }
 
@@ -220,7 +224,15 @@ function flowBackedOAuth(
 		isSubscription,
 		usesCallbackServer: options?.usesCallbackServer,
 		async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-			return getBuiltinOAuthFlow(providerId).login(toAuthInteraction(callbacks));
+			// Pi's new `openai` ChatGPT subscription OAuth refuses to start without
+			// a device UUID. Pi's native login provides one via LoginOptions; the
+			// legacy extension OAuth adapter does not, so we mint/reuse the same
+			// deviceId pi stores in settings.json and forward it here. Harmless for
+			// flows that ignore it.
+			return getBuiltinOAuthFlow(providerId).login(
+				toAuthInteraction(callbacks),
+				{ getDeviceId: () => getAgentDeviceId() },
+			);
 		},
 		async refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials> {
 			return getBuiltinOAuthFlow(providerId).refresh(
@@ -416,6 +428,26 @@ function getAuthStorage(ctx: ExtensionContext | ExtensionCommandContext): AuthSt
 			await registry.runtime.logout(provider);
 		},
 	};
+}
+
+/** Agent-wide device UUID stored in pi's settings.json. Pi's new OpenAI
+ *  ChatGPT subscription OAuth refuses to start without it; reusing the same
+ *  value keeps our extra accounts bound to the same installation identity
+ *  that pi uses for its native login. */
+let cachedDeviceId: string | undefined;
+function getAgentDeviceId(): string | undefined {
+	if (cachedDeviceId) return cachedDeviceId;
+	try {
+		const settings = SettingsManager.create(process.cwd(), getAgentDir());
+		const id = settings.getOrCreateDeviceId();
+		if (typeof id === "string" && id.length > 0) {
+			cachedDeviceId = id;
+			return id;
+		}
+	} catch {
+		// SettingsManager unavailable (older pi) or storage locked; fall through.
+	}
+	return undefined;
 }
 
 // ==========================================================================
