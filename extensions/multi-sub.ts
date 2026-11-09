@@ -7371,6 +7371,25 @@ function shortenPathForStatusBar(path: string): string {
 	return shortened;
 }
 
+/**
+ * The model id the status bar shows. For a virtual model (pi's `pi-virtual` API, such as a router's
+ * `auto`) that is the physical model that answered last, because the virtual id never changes.
+ */
+function statusBarModelId(ctx: ExtensionContext): string | undefined {
+	const model = ctx.model;
+	if (!model) return undefined;
+	if (model.api !== "pi-virtual") return model.id;
+	const entries = ctx.sessionManager.getBranch();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i] as { type?: string; message?: { role?: string; model?: string; stopReason?: string } };
+		const message = entry.type === "message" ? entry.message : undefined;
+		if (message?.role === "assistant" && message.model && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			return message.model;
+		}
+	}
+	return model.id;
+}
+
 function renderStatusBarLine(
 	theme: Theme,
 	footerData: ReadonlyFooterDataProvider,
@@ -7403,7 +7422,8 @@ function renderStatusBarLine(
 	const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 	const rightParts: string[] = [];
 	rightParts.push(shortenPathForStatusBar(ctx.cwd));
-	if (ctx.model) rightParts.push(ctx.model.id);
+	const modelId = statusBarModelId(ctx);
+	if (modelId) rightParts.push(modelId);
 	const usage = ctx.getContextUsage();
 	if (usage?.percent != null) rightParts.push(`ctx ${Math.round(usage.percent)}%`);
 	const branch = footerData.getGitBranch();
