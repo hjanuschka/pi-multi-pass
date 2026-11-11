@@ -1972,12 +1972,37 @@ const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
 	},
 };
 
-// The new `openai` ChatGPT-subscription OAuth yields the same chatgpt.com
-// bearer as the legacy `openai-codex` flow, so the usage endpoint and parser
-// are shared via the codex checker's `check` function.
+// The `openai` OAuth may yield either a chatgpt.com bearer (shared with the
+// legacy `openai-codex` flow) or an api.openai.com token without a
+// `chatgpt_account_id` claim. The latter cannot read any known usage
+// endpoint (chatgpt.com/backend-api/wham/usage answers 401), so report that
+// instead of the raw 401.
 const openaiQuotaChecker: ProviderQuotaChecker = {
 	baseProvider: "openai",
-	check: codexQuotaChecker.check,
+	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
+		const auth = account.auth;
+		if (auth?.type === "oauth" && typeof auth.access === "string" && auth.access.length > 0) {
+			const accountId = typeof auth.accountId === "string" && auth.accountId.length > 0
+				? auth.accountId
+				: getCodexTokenMetadata(auth.access).accountId;
+			if (!accountId) {
+				return {
+					account,
+					kind: "error",
+					summary: "usage not available for this login",
+					details: [
+						`account: ${account.displayName}`,
+						`provider: ${account.providerName}`,
+						"status: usage not available",
+						"details: token has no chatgpt_account_id claim; no known usage endpoint accepts it",
+						"note: requests still work, only usage reporting is unavailable",
+					],
+					score: 0,
+				};
+			}
+		}
+		return codexQuotaChecker.check(account, signal);
+	},
 };
 
 const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
@@ -7278,6 +7303,8 @@ async function handlePresetMenu(
 // ==========================================================================
 
 const STATUS_BAR_QUOTA_REFRESH_MS = 5 * 60_000;
+const STATUS_BAR_QUOTA_BACKOFF_MAX_MS = 30 * 60_000;
+const STATUS_BAR_QUOTA_TIMEOUT_MS = 15_000;
 const STATUS_BAR_CLOCK_MS = 30_000;
 
 const STATUS_BAR_GLYPHS: Record<string, string> = {
@@ -7312,6 +7339,38 @@ let statusBarAccounts: StatusBarAccount[] = [];
 const statusBarQuota = new Map<string, QuotaCheckResult>();
 let statusBarQuotaFetchedAt = 0;
 let statusBarRefreshInFlight = false;
+let statusBarQuotaFailures = 0;
+
+function statusBarQuotaDelayMs(): number {
+	return Math.min(
+		STATUS_BAR_QUOTA_REFRESH_MS * 2 ** statusBarQuotaFailures,
+		STATUS_BAR_QUOTA_BACKOFF_MAX_MS,
+	);
+}
+
+/**
+ * Merges fresh quota results into the status bar map. An error result (e.g.
+ * HTTP 429 from the usage endpoint) keeps the previous good value for that
+ * account instead of degrading the bar to `?`.
+ */
+function mergeStatusBarQuota(
+	previous: ReadonlyMap<string, QuotaCheckResult>,
+	results: QuotaCheckResult[],
+): { entries: Array<[string, QuotaCheckResult]>; allFailed: boolean } {
+	let allFailed = results.length > 0;
+	const entries: Array<[string, QuotaCheckResult]> = [];
+	for (const result of results) {
+		const key = result.account.providerName;
+		const prev = previous.get(key);
+		if (result.kind === "error" && prev?.worstRemainingPercent !== undefined) {
+			entries.push([key, prev]);
+		} else {
+			entries.push([key, result]);
+		}
+		if (result.kind !== "error") allFailed = false;
+	}
+	return { entries, allFailed };
+}
 
 function statusBarShortName(providerName: string, subs: SubEntry[]): string {
 	const entry = subs.find((candidate) => subProviderName(candidate) === providerName);
@@ -7334,11 +7393,21 @@ function collectStatusBarAccounts(ctx: ExtensionContext): StatusBarAccount[] {
 
 function refreshStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void {
 	if (statusBarRefreshInFlight) return;
+	if (
+		statusBarQuotaFailures > 0
+		&& Date.now() - statusBarQuotaFetchedAt < statusBarQuotaDelayMs()
+	) {
+		return;
+	}
 	statusBarRefreshInFlight = true;
 	statusBarAccounts = collectStatusBarAccounts(ctx);
 	const accounts = collectQuotaAccounts(ctx);
-	runQuotaChecks(accounts.filter((account) => account.auth))
+	runQuotaChecks(
+		accounts.filter((account) => account.auth),
+		AbortSignal.timeout(STATUS_BAR_QUOTA_TIMEOUT_MS),
+	)
 		.then((results) => {
+			const { entries, allFailed } = mergeStatusBarQuota(statusBarQuota, results);
 			statusBarQuota.clear();
 			for (const account of accounts) {
 				if (account.auth) continue;
@@ -7350,10 +7419,11 @@ function refreshStatusBarQuota(ctx: ExtensionContext, onDone: () => void): void 
 					score: 0,
 				});
 			}
-			for (const result of results) {
-				statusBarQuota.set(result.account.providerName, result);
+			for (const [key, result] of entries) {
+				statusBarQuota.set(key, result);
 			}
 			statusBarQuotaFetchedAt = Date.now();
+			statusBarQuotaFailures = allFailed ? statusBarQuotaFailures + 1 : 0;
 		})
 		.catch(() => {})
 		.finally(() => {
@@ -7369,6 +7439,25 @@ function shortenPathForStatusBar(path: string): string {
 		shortened = `\u2026${shortened.slice(-27)}`;
 	}
 	return shortened;
+}
+
+/**
+ * The model id the status bar shows. For a virtual model (pi's `pi-virtual` API, such as a router's
+ * `auto`) that is the physical model that answered last, because the virtual id never changes.
+ */
+function statusBarModelId(ctx: ExtensionContext): string | undefined {
+	const model = ctx.model;
+	if (!model) return undefined;
+	if (model.api !== "pi-virtual") return model.id;
+	const entries = ctx.sessionManager.getBranch();
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i] as { type?: string; message?: { role?: string; model?: string; stopReason?: string } };
+		const message = entry.type === "message" ? entry.message : undefined;
+		if (message?.role === "assistant" && message.model && message.stopReason !== "error" && message.stopReason !== "aborted") {
+			return message.model;
+		}
+	}
+	return model.id;
 }
 
 function renderStatusBarLine(
@@ -7403,7 +7492,8 @@ function renderStatusBarLine(
 	const clock = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 	const rightParts: string[] = [];
 	rightParts.push(shortenPathForStatusBar(ctx.cwd));
-	if (ctx.model) rightParts.push(ctx.model.id);
+	const modelId = statusBarModelId(ctx);
+	if (modelId) rightParts.push(modelId);
 	const usage = ctx.getContextUsage();
 	if (usage?.percent != null) rightParts.push(`ctx ${Math.round(usage.percent)}%`);
 	const branch = footerData.getGitBranch();
@@ -7484,13 +7574,18 @@ function applyStatusBar(ctx: ExtensionContext | ExtensionCommandContext, enabled
 let modelInterceptContext: ExtensionContext | ExtensionCommandContext | undefined;
 let modelInterceptPi: ExtensionAPI | undefined;
 let modelInterceptActive = false;
+let modelInterceptPreviousFactory: ReturnType<ExtensionContext["ui"]["getEditorComponent"]>;
 
 function createModelInterceptEditor(
 	tui: any,
 	theme: any,
 	keybindings: any,
+	delegate?: ReturnType<ExtensionContext["ui"]["getEditorComponent"]>,
 ): CustomEditor {
-	const editor = new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+	// Another extension may have installed its own editor; wrap that instead
+	// of replacing it, since only `onSubmit` needs intercepting.
+	const editor = (delegate?.(tui, theme, keybindings) as CustomEditor | undefined)
+		?? new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
 	let wrapped: ((text: string) => void) | undefined;
 	Object.defineProperty(editor, "onSubmit", {
 		configurable: true,
@@ -7536,12 +7631,15 @@ function applyModelIntercept(
 	modelInterceptPi = pi;
 	if (!ctx.hasUI) return;
 	if (enabled && !modelInterceptActive) {
+		const previous = ctx.ui.getEditorComponent();
+		modelInterceptPreviousFactory = previous;
 		ctx.ui.setEditorComponent((tui, theme, keybindings) =>
-			createModelInterceptEditor(tui, theme, keybindings),
+			createModelInterceptEditor(tui, theme, keybindings, previous),
 		);
 		modelInterceptActive = true;
 	} else if (!enabled && modelInterceptActive) {
-		ctx.ui.setEditorComponent(undefined);
+		ctx.ui.setEditorComponent(modelInterceptPreviousFactory);
+		modelInterceptPreviousFactory = undefined;
 		modelInterceptActive = false;
 	}
 }

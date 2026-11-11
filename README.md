@@ -437,7 +437,7 @@ Currently implemented:
 
 - `anthropic`: fetches Claude subscription usage from `https://api.anthropic.com/api/oauth/usage`, then summarizes the 5-hour and 7-day windows plus any model-scoped weekly limits (for example Opus) for the base account and extra Anthropic subscriptions. Plan and email come from the OAuth profile endpoint.
 - `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
-- `openai`: same ChatGPT subscription backend as `openai-codex`; the new OpenAI OAuth returns a chatgpt.com bearer so the usage endpoint and parser are shared.
+- `openai`: same ChatGPT subscription backend as `openai-codex` when the OAuth token carries a `chatgpt_account_id` claim. Newer OpenAI OAuth logins may return an api.openai.com token without that claim; no known usage endpoint accepts such tokens, so `/subs limits` reports "usage not available for this login" for them (requests still work, only usage reporting is unavailable).
 - `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
 - `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
 
